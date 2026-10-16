@@ -5,7 +5,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -17,21 +17,25 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 from tracker import (
-    CHARACTERS, MAIN_INDEX, MOSCOW, TARGET, BUYOUT_COST, WEEKLY_REWARD, Tracker,
-    clock_hm, game_day, game_day_end, game_week, next_week,
+    CHARACTERS, MAIN_INDEX, TARGET, BUYOUT_COST, Tracker, clock_hm, game_day,
+    game_week, human_date, next_week, previous_week, week_day_number,
 )
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("wow_tracker")
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID_TEXT = os.getenv("OWNER_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "data/tracker.sqlite3")
+DB_PATH = Path(os.getenv("DB_PATH", "data/tracker.sqlite3"))
+if not DB_PATH.is_absolute():
+    DB_PATH = BASE_DIR / DB_PATH
+ALERT_DELETE_DELAY = 10 * 60
 
 router = Router()
 tracker: Tracker
-owner_id: int
+owner_id = 0
 
 
 class RemainingInput(StatesGroup):
@@ -46,12 +50,10 @@ def markup_home():
     b = InlineKeyboardBuilder()
     for i, character in enumerate(CHARACTERS):
         b.button(text=character, callback_data=f"view:char:{i}")
-    b.adjust(1)
     b.button(text="🎁 Награды", callback_data="view:rewards")
-    b.button(text="🪙 Неделя и токены", callback_data="view:week")
     b.button(text="📊 История", callback_data="view:history")
     b.button(text="🔄 Обновить", callback_data="view:home")
-    b.adjust(*([1] * 7), 2, 2)
+    b.adjust(*([1] * 7), 2, 1)
     return b.as_markup()
 
 
@@ -77,7 +79,6 @@ def markup_char(index: int, now: float):
             b.button(text="↩️ Отменить получение награды", callback_data=f"action:reward_off:{index}:{day}")
         else:
             b.button(text="🎁 Награда получена", callback_data=f"action:reward_on:{index}:{day}")
-    b.button(text="🪙 Неделя персонажа", callback_data=f"view:weekchar:{index}")
     b.button(text="🎁 Все награды", callback_data="view:rewards")
     b.button(text="⬅️ К списку", callback_data="view:home")
     b.adjust(1)
@@ -100,13 +101,29 @@ def markup_rewards(now: float):
     return b.as_markup()
 
 
-def markup_week():
+def markup_history(now: float, previous: bool = False):
     b = InlineKeyboardBuilder()
-    for i, char in enumerate(CHARACTERS):
-        b.button(text=char, callback_data=f"view:weekchar:{i}")
-    b.button(text="🔄 Обновить", callback_data="view:week")
+    if previous:
+        b.button(text="📊 Текущая неделя", callback_data="view:history")
+        b.button(text="🔄 Обновить", callback_data="view:historyprev")
+    else:
+        if tracker.week_stats(now)["missed_count"]:
+            b.button(text="💳 Выкупы", callback_data="view:buyouts")
+        b.button(text="⬅️ Прошлая неделя", callback_data="view:historyprev")
+        b.button(text="🔄 Обновить", callback_data="view:history")
     b.button(text="⬅️ На главную", callback_data="view:home")
-    b.adjust(*([1] * 7), 2)
+    b.adjust(1)
+    return b.as_markup()
+
+
+def markup_buyouts(now: float):
+    b = InlineKeyboardBuilder()
+    stats = tracker.week_stats(now)
+    for char in stats["characters"]:
+        if char["missed"]:
+            b.button(text=char["name"], callback_data=f"view:weekchar:{char['index']}")
+    b.button(text="⬅️ К истории", callback_data="view:history")
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -115,9 +132,9 @@ def markup_weekchar(index: int, now: float):
     stats = tracker.week_stats(now)
     char = stats["characters"][index]
     for day in char["missed"]:
-        b.button(text=f"💳 Отметить выкуп {day[5:]} (−{BUYOUT_COST})",
+        b.button(text=f"💳 Отметить выкуп {human_date(day)} (−{BUYOUT_COST})",
                  callback_data=f"buy:confirm:{index}:{day}")
-    b.button(text="⬅️ К неделе", callback_data="view:week")
+    b.button(text="⬅️ К выкупам", callback_data="view:buyouts")
     b.adjust(1)
     return b.as_markup()
 
@@ -128,12 +145,6 @@ def markup_buy_confirm(index: int, day: str):
              callback_data=f"buy:apply:{index}:{day}")
     b.button(text="Отмена", callback_data=f"view:weekchar:{index}")
     b.adjust(1)
-    return b.as_markup()
-
-
-def markup_back():
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ К списку", callback_data="view:home")
     return b.as_markup()
 
 
@@ -151,27 +162,31 @@ def status_label(p) -> str:
 
 def home_text(now: float) -> str:
     day = game_day(now)
-    end = datetime.fromtimestamp(game_day_end(day), MOSCOW)
+    week = game_week(now)
     rows = tracker.all_progress(now)
     total_done = sum(p.fully_done for p in rows)
-    lines = ["🎮 WoW Tracker", f"Игровые сутки: {day}",
-             f"Сброс: {end:%d.%m %H:%M} МСК", f"Закрыто: {total_done}/7", ""]
+    lines = ["🎮 WoW Tracker", f"Игровые сутки: {human_date(day)}",
+             f"Неделя: {human_date(week)} — {human_date(next_week(week))}"]
+    lines.extend([f"День {week_day_number(now)}", f"Закрыто: {total_done}/7"])
+    balance = tracker.token_balance()
+    if balance is not None:
+        lines.append(f"Учётный баланс сейчас: {balance}")
+    lines.append("")
     for p in rows:
         name = CHARACTERS[p.character]
         if p.character == MAIN_INDEX:
             desc = "ручная отметка"
         else:
-            desc = f"{clock_hm(p.elapsed)}/02:00"
+            desc = (f"{clock_hm(p.elapsed)}/02:00 — осталось "
+                    f"{clock_hm(TARGET - p.elapsed)}")
         symbol = "✅" if p.fully_done else "🎁" if p.norm_done else "▶️" if p.running else "▫️"
         lines.append(f"{symbol} {name} — {desc}")
-    lines.append("\nДень выполнен только после получения награды до 07:00 МСК.")
-    lines.append("Недельные токены: кнопка «🪙 Неделя и токены».")
     return "\n".join(lines)
 
 
 def character_text(index: int, now: float) -> str:
     p = tracker.progress(index, now)
-    lines = [f"🎮 {CHARACTERS[index]}", f"Игровые сутки: {game_day(now)}", ""]
+    lines = [f"🎮 {CHARACTERS[index]}", f"Игровые сутки: {human_date(game_day(now))}", ""]
     if index == MAIN_INDEX:
         lines.append(f"Норма: {'✅ Отмечена вручную' if p.manual_done else '▫️ Не отмечена'}")
         lines.append("Таймер и уведомления отключены.")
@@ -186,7 +201,7 @@ def character_text(index: int, now: float) -> str:
 
 def rewards_text(now: float) -> str:
     rows = tracker.all_progress(now)
-    lines = ["🎁 Награды за игровые сутки " + game_day(now), ""]
+    lines = ["🎁 Награды за игровые сутки " + human_date(game_day(now)), ""]
     for p in rows:
         label = "✅ Получена" if p.reward_received else "🎁 Можно отметить" if p.norm_done else "🔒 Сначала норма"
         lines.append(f"{CHARACTERS[p.character]} — {label}")
@@ -195,38 +210,18 @@ def rewards_text(now: float) -> str:
     return "\n".join(lines)
 
 
-def week_text(now: float) -> str:
+def buyouts_text(now: float) -> str:
     stats = tracker.week_stats(now)
-    end = next_week(stats["week"])
-    lines = [f"🪙 Неделя: {stats['week']} — {end} (07:00 МСК)",
-             f"Каждому персонажу: +{WEEKLY_REWARD} за 7 закрытых дней.",
-             f"Выкуп пропущенного дня для одного персонажа: −{BUYOUT_COST}.", ""]
-    for char in stats["characters"]:
-        symbol = "⚠️" if char["missed"] else "✅" if char["covered"] == 7 else "⏳"
-        lines.append(f"{symbol} {char['name']}: {char['covered']}/7, прогноз +{char['forecast']}")
-    lines.extend(["", f"Выкупы за неделю: −{stats['expenses']}",
-                  f"Прогноз бонусов*: +{stats['forecast_bonus']}",
-                  f"Прогноз итога недели*: {stats['forecast_net']:+} токенов"])
-    if stats["missed_count"]:
-        lines.append(f"Если выкупить все {stats['missed_count']} пропусков: "
-                     f"{stats['net_if_all_bought']:+} токенов чистыми")
-    balance = tracker.token_balance()
-    if balance is None:
-        lines.append("Баланс не задан. Введи /balance 250 (реальное число токенов).")
-    else:
-        lines.extend([f"Учётный баланс сейчас: {balance}",
-                      f"Ожидаемый баланс*: {balance + stats['forecast_bonus']}"])
-    lines.extend(["", "*При условии, что сегодня и все оставшиеся дни недели будут закрыты.",
-                  "Выкупы записываются только после реальной покупки в WoW; бот не покупает их сам.",
-                  "В среду в 07:00 МСК неделя закрывается, +100 начисляется за каждого персонажа с 7/7."])
-    return "\n".join(lines)
+    return (f"💳 Выкупы — неделя {human_date(stats['week'])} — "
+            f"{human_date(next_week(stats['week']))}\n\n"
+            "Выбери персонажа с пропущенным днём.")
 
 
 def weekchar_text(index: int, now: float) -> str:
     stats = tracker.week_stats(now)
     char = stats["characters"][index]
     today = game_day(now)
-    lines = [f"🪙 {char['name']} — неделя {stats['week']}",
+    lines = [f"💳 {char['name']} — неделя {human_date(stats['week'])}",
              f"Закрыто: {char['covered']}/7; выкуплено: {len(char['bought'])}", ""]
     for day in stats["days"]:
         if tracker.was_bought(day, index):
@@ -239,7 +234,7 @@ def weekchar_text(index: int, now: float) -> str:
             state = "⏳ Сегодня (до 07:00 МСК)"
         else:
             state = "▫️ Впереди"
-        lines.append(f"{day[5:]} — {state}")
+        lines.append(f"{human_date(day)} — {state}")
     lines.extend(["", f"Прогноз награды: +{char['forecast']} токенов",
                   "Покупку выкупа делай в WoW, затем отмечай её кнопкой ниже.",
                   "Выкупить можно пропущенный день до конца недельного КД."])
@@ -252,11 +247,16 @@ def screen(view: str, now: float, index: int | None = None):
     if view == "rewards":
         return rewards_text(now), markup_rewards(now)
     if view == "week":
-        return week_text(now), markup_week()
+        return tracker.history(now), markup_history(now)
     if view == "weekchar" and index is not None:
         return weekchar_text(index, now), markup_weekchar(index, now)
     if view == "history":
-        return tracker.history(now), markup_back()
+        return tracker.history(now), markup_history(now)
+    if view == "historyprev":
+        week = previous_week(game_week(now))
+        return tracker.history(now, week), markup_history(now, previous=True)
+    if view == "buyouts":
+        return buyouts_text(now), markup_buyouts(now)
     return home_text(now), markup_home()
 
 
@@ -307,7 +307,7 @@ async def cmd_week(message: Message, state: FSMContext) -> None:
     await state.clear()
     now = time.time()
     tracker.settle_weeks(now)
-    text, markup = screen("week", now)
+    text, markup = screen("history", now)
     await message.answer(text, reply_markup=markup)
 
 
@@ -347,7 +347,7 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await message.answer(
-        "Команды: /start, /status, /rewards, /history, /week, /balance [число], /cancel, /help.\n\n"
+        "Команды: /start, /status, /rewards, /history, /balance [число], /cancel, /help.\n\n"
         "Выбери персонажа и нажми ▶️, когда зайдёшь в игру. "
         "На паузе время не растёт. При запуске другого чара старый таймер автоматически останавливается.\n\n"
         "Если WoW-сервер упал или время посчиталось неправильно, "
@@ -356,9 +356,8 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
         "0 означает, что норма уже выполнена. /cancel отменяет ввод.\n\n"
         "Предупреждение придёт за 5 минут и по достижении 2 часов. "
         "Награду после нормы отметь отдельной кнопкой до 07:00 МСК.\n\n"
-        "В среду в 07:00 МСК недельный сброс. Каждый чар даёт +100 токенов за 7 закрытых дней. "
-        "Один пропущенный день одного персонажа можно выкупить за 50 токенов; "
-        "нажми кнопку подтверждения в боте ПОСЛЕ покупки в игре. "
+        "Недельный прогресс и прошлая неделя находятся в разделе «История». "
+        "Пропущенный день можно отметить как выкупленный там после покупки в игре. "
         "Баланс можно задать командой /balance 250.\n\n"
         "Инферналь: ручная норма и отдельная награда, без таймера и уведомлений. "
         "Бот не считывает фактический онлайн из WoW: всё учитывается по твоим нажатиям."
@@ -450,7 +449,7 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
                 await redraw(callback, "weekchar", index)
                 return
             await callback.answer()
-            text = (f"Подтвердить учёт выкупа?\n\n{CHARACTERS[index]} — {day}\n"
+            text = (f"Подтвердить учёт выкупа?\n\n{CHARACTERS[index]} — {human_date(day)}\n"
                     f"Стоимость: −{BUYOUT_COST} токенов.\n\n"
                     "Подтверждай только после фактической покупки в игре. Отмены расхода нет.")
             if isinstance(callback.message, Message):
@@ -525,16 +524,29 @@ async def worker(bot: Bot) -> None:
             week_to_report = tracker.unreported_week(now)
             if week_to_report is not None:
                 await bot.send_message(owner_id, tracker.weekly_report(week_to_report, now))
-                tracker.set_meta("last_week_reported", game_week(time.time()))
+                tracker.set_meta("last_week_reported", game_week(now))
             day_to_report = tracker.unreported_day(now)
             if day_to_report is not None:
                 # If the bot was offline for several days, show the most recent
                 # recorded day, rather than sending multiple historical alerts.
                 await bot.send_message(owner_id, tracker.daily_report(day_to_report))
-                tracker.set_meta("last_day_reported", game_day(time.time()))
-            for index, kind, alert in tracker.due_alerts(time.time()):
-                await bot.send_message(owner_id, alert)
-                tracker.mark_alert_sent(index, kind, time.time())
+                tracker.set_meta("last_day_reported", game_day(now))
+            for chat_id, message_id in tracker.due_message_deletions(now):
+                try:
+                    await bot.delete_message(chat_id, message_id)
+                except TelegramBadRequest:
+                    pass
+                tracker.forget_message_deletion(chat_id, message_id)
+            for index, kind, alert in tracker.due_alerts(now):
+                message = await bot.send_message(owner_id, alert)
+                tracker.mark_alert_sent(
+                    index,
+                    kind,
+                    now,
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    delete_at=time.time() + ALERT_DELETE_DELAY,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -546,7 +558,12 @@ async def main() -> None:
     global tracker, owner_id
     if not TOKEN or not OWNER_ID_TEXT:
         raise RuntimeError("Заполни BOT_TOKEN и OWNER_ID в .env")
-    owner_id = int(OWNER_ID_TEXT)
+    try:
+        owner_id = int(OWNER_ID_TEXT)
+    except ValueError as ex:
+        raise RuntimeError("OWNER_ID в .env должен быть целым числом") from ex
+    if owner_id <= 0:
+        raise RuntimeError("OWNER_ID в .env должен быть положительным числом")
     tracker = Tracker(DB_PATH)
     now = time.time()
     tracker.init_day_marker(now)

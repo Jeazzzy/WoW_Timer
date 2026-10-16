@@ -10,7 +10,13 @@ from zoneinfo import ZoneInfo
 
 MOSCOW = ZoneInfo("Europe/Moscow")
 CHARACTERS = (
-    "Эдгвин", "Усатыйморж", "Элнин", "Jeazzy", "Бэйбик", "Чамингтон", "Инферналь"
+    "Маг Эдгвин",
+    "Рыцарь смерти Усатыйморж",
+    "Паладин Элнин",
+    "Воин Jeazzy",
+    "Монах Бэйбик",
+    "Шаман Чамингтон",
+    "Охотник на демонов Инферналь",
 )
 MAIN_INDEX = 6
 TARGET = 2 * 60 * 60
@@ -46,6 +52,20 @@ def week_days(week: str) -> list[str]:
 
 def next_week(week: str) -> str:
     return (date.fromisoformat(week) + timedelta(days=7)).isoformat()
+
+
+def previous_week(week: str) -> str:
+    return (date.fromisoformat(week) - timedelta(days=7)).isoformat()
+
+
+def human_date(day: str) -> str:
+    return date.fromisoformat(day).strftime("%d.%m.%Y")
+
+
+def week_day_number(now: float) -> int:
+    current_day = date.fromisoformat(game_day(now))
+    start = date.fromisoformat(game_week(now))
+    return (current_day - start).days + 1
 
 
 def clock_hm(seconds: float) -> str:
@@ -116,7 +136,43 @@ class Tracker:
                 description TEXT NOT NULL
             )
         """)
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS pending_message_deletions (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                delete_at REAL NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+        """)
+        self._migrate_progress_table()
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS buyouts_by_day ON buyouts(day)"
+        )
+        self.con.execute(
+            "CREATE INDEX IF NOT EXISTS pending_deletions_by_time "
+            "ON pending_message_deletions(delete_at)"
+        )
         self.con.commit()
+
+    def _migrate_progress_table(self) -> None:
+        """Add fields introduced after the first daily-tracker release."""
+        columns = {
+            str(row["name"])
+            for row in self.con.execute("PRAGMA table_info(progress)").fetchall()
+        }
+        additions = {
+            "elapsed": "REAL NOT NULL DEFAULT 0",
+            "started_at": "REAL",
+            "warned_five": "INTEGER NOT NULL DEFAULT 0",
+            "notified_done": "INTEGER NOT NULL DEFAULT 0",
+            "manual_done": "INTEGER NOT NULL DEFAULT 0",
+            "reward_received": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.con.execute(
+                    f"ALTER TABLE progress ADD COLUMN {name} {definition}"
+                )
 
     def close(self) -> None:
         self.con.close()
@@ -330,8 +386,24 @@ class Tracker:
                 alerts.append((i, "five", f"⏳ {CHARACTERS[i]}: осталось 5 минут до нормы!"))
         return alerts
 
-    def mark_alert_sent(self, index: int, kind: str, now: float) -> None:
-        field = "warned_five" if kind == "five" else "notified_done"
+    def mark_alert_sent(
+        self,
+        index: int,
+        kind: str,
+        now: float,
+        chat_id: int | None = None,
+        message_id: int | None = None,
+        delete_at: float | None = None,
+    ) -> None:
+        fields = {"five": "warned_five", "done": "notified_done"}
+        if kind not in fields:
+            raise ValueError("Неизвестный тип уведомления")
+        deletion_values = (chat_id, message_id, delete_at)
+        if any(value is not None for value in deletion_values) and any(
+            value is None for value in deletion_values
+        ):
+            raise ValueError("Для удаления сообщения нужны chat_id, message_id и delete_at")
+        field = fields[kind]
         self.con.execute(
             f"UPDATE progress SET {field}=1 WHERE day=? AND character=?",
             (game_day(now), index)
@@ -339,6 +411,27 @@ class Tracker:
         if kind == "done":
             # We track at most the required 2 hours; continued online time is irrelevant.
             self._settle(game_day(now), index, now)
+        if chat_id is not None and message_id is not None and delete_at is not None:
+            self.con.execute(
+                "INSERT OR REPLACE INTO pending_message_deletions "
+                "(chat_id, message_id, delete_at) VALUES (?,?,?)",
+                (chat_id, message_id, delete_at),
+            )
+        self.con.commit()
+
+    def due_message_deletions(self, now: float) -> list[tuple[int, int]]:
+        rows = self.con.execute(
+            "SELECT chat_id, message_id FROM pending_message_deletions "
+            "WHERE delete_at<=? ORDER BY delete_at",
+            (now,),
+        ).fetchall()
+        return [(int(row["chat_id"]), int(row["message_id"])) for row in rows]
+
+    def forget_message_deletion(self, chat_id: int, message_id: int) -> None:
+        self.con.execute(
+            "DELETE FROM pending_message_deletions WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        )
         self.con.commit()
 
     def unreported_day(self, now: float) -> str | None:
@@ -346,7 +439,7 @@ class Tracker:
         current = game_day(now)
         seen = self.get_meta("last_day_reported")
         if seen and seen < current:
-            return seen
+            return (date.fromisoformat(current) - timedelta(days=1)).isoformat()
         return None
 
     def daily_report(self, day: str) -> str:
@@ -354,7 +447,7 @@ class Tracker:
         end = game_day_end(day)
         rows = self.all_progress(end, day)
         completed = [CHARACTERS[s.character] for s in rows if s.fully_done]
-        lines = [f"📅 Итоги игровых суток {day} (07:00 МСК)",
+        lines = [f"📅 Итоги игровых суток {human_date(day)} (07:00 МСК)",
                  f"Полностью выполнено: {len(completed)}/7", ""]
         for state in rows:
             name = CHARACTERS[state.character]
@@ -369,17 +462,31 @@ class Tracker:
         lines.extend(["", "Неполученные награды сгорели, в новый день они не переходят."])
         return "\n".join(lines)
 
-    def history(self, now: float, days: int = 7) -> str:
-        today = date.fromisoformat(game_day(now))
-        lines = ["📊 История (последние игровые сутки)"]
-        for shift in range(1, days + 1):
-            day = (today - timedelta(days=shift)).isoformat()
-            states = self.all_progress(game_day_end(day), day)
-            naturally = sum(s.fully_done for s in states)
-            compensated = sum(self.was_bought(day, i) for i in range(len(CHARACTERS)))
-            lines.append(f"{day}: награды {naturally}/7, выкупы {compensated}")
-        lines.append("Выкуп помогает недельной серии только того персонажа, для которого записан.")
-        lines.append("Ежедневная награда засчитывается лишь до 07:00 МСК.")
+    def week_tokens_received(self, week: str) -> int:
+        value = self.con.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM token_ledger "
+            "WHERE id LIKE ? AND amount > 0",
+            (f"bonus:{week}:%",),
+        ).fetchone()[0]
+        return int(value)
+
+    def history(self, now: float, week: str | None = None) -> str:
+        week = week or game_week(now)
+        days = week_days(week)
+        lines = [f"📊 Неделя: {human_date(week)} — {human_date(next_week(week))}"]
+        collected = 0
+        for day in days:
+            states = self.all_progress(min(now, game_day_end(day)), day)
+            rewards = sum(state.fully_done for state in states)
+            collected += rewards
+            lines.append(f"{human_date(day)} — награды {rewards}/7")
+        bought = int(self.con.execute(
+            "SELECT COUNT(*) FROM buyouts WHERE day>=? AND day<?",
+            (week, next_week(week)),
+        ).fetchone()[0])
+        lines.extend(["", f"Собрано наград: {collected}/49", f"Выкуплено дней: {bought}"])
+        if week < game_week(now):
+            lines.append(f"Получено токенов: {self.week_tokens_received(week)}")
         return "\n".join(lines)
 
 
@@ -433,7 +540,8 @@ class Tracker:
              f"Выкуп {day}: {CHARACTERS[index]}")
         )
         self.con.commit()
-        return f"✅ Выкуп {day} для {CHARACTERS[index]} учтён (−{BUYOUT_COST} токенов)."
+        return (f"✅ Выкуп {human_date(day)} для {CHARACTERS[index]} "
+                f"учтён (−{BUYOUT_COST} токенов).")
 
     def token_balance(self) -> int | None:
         """Estimate after user supplies real in-game balance at least once."""
@@ -501,14 +609,15 @@ class Tracker:
             awards = 0
             for char in stats["characters"]:
                 if char["earned"]:
-                    self.con.execute(
+                    cursor = self.con.execute(
                         "INSERT OR IGNORE INTO token_ledger(id, created_at, amount, description) "
                         "VALUES (?,?,?,?)",
                         (f"bonus:{active}:{char['index']}",
                          now, WEEKLY_REWARD,
                          f"Недельная награда {active}: {char['name']}")
                     )
-                    awards += WEEKLY_REWARD
+                    if cursor.rowcount:
+                        awards += WEEKLY_REWARD
             self.con.execute(
                 "INSERT INTO metadata(key,value) VALUES ('active_week',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -529,7 +638,7 @@ class Tracker:
 
     def weekly_report(self, week: str, now: float) -> str:
         stats = self.week_stats(now, week)
-        lines = [f"🏁 Итоги недели {week} — {next_week(week)} (07:00 МСК)"]
+        lines = [f"🏁 Итоги недели {human_date(week)} — {human_date(next_week(week))} (07:00 МСК)"]
         for char in stats["characters"]:
             sign = "✅" if char["earned"] else "❌"
             lines.append(f"{sign} {char['name']}: {char['covered']}/7, +{char['earned']} токенов")

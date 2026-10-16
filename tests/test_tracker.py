@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -5,7 +6,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from tracker import (MAIN_INDEX, TARGET, Tracker, game_day, game_week, week_days,
-                     next_week, WEEKLY_REWARD, BUYOUT_COST)
+                     next_week, WEEKLY_REWARD, BUYOUT_COST, human_date,
+                     previous_week, week_day_number)
 
 TZ = ZoneInfo('Europe/Moscow')
 
@@ -26,6 +28,9 @@ class TrackerTest(unittest.TestCase):
     def test_day_boundary_7_moscow(self):
         self.assertEqual(game_day(ts('2026-10-16', 6, 59, 59)), '2026-10-15')
         self.assertEqual(game_day(ts('2026-10-16', 7)), '2026-10-16')
+        self.assertEqual(human_date('2026-10-16'), '16.10.2026')
+        self.assertEqual(week_day_number(ts('2026-10-15', 8)), 2)
+        self.assertEqual(previous_week('2026-10-14'), '2026-10-07')
 
     def test_pauses_and_switching_are_cumulative(self):
         t = ts('2026-10-15', 8)
@@ -59,7 +64,7 @@ class TrackerTest(unittest.TestCase):
         self.assertTrue(self.tr.progress(2, t+TARGET).fully_done)
         tomorrow = ts('2026-10-16', 8)
         self.assertFalse(self.tr.progress(2, tomorrow).fully_done)
-        self.assertIn('✅ Элнин', self.tr.daily_report('2026-10-15'))
+        self.assertIn('✅ Паладин Элнин', self.tr.daily_report('2026-10-15'))
 
     def test_infernal_manual_without_timer(self):
         t = ts('2026-10-15', 8)
@@ -87,6 +92,40 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(self.tr.due_alerts(t+TARGET+60), [])
         self.assertFalse(self.tr.progress(4, t+TARGET+60).running)
 
+    def test_sent_alert_flags_survive_reopen(self):
+        start = ts('2026-10-15', 9)
+        self.tr.start(4, start)
+        warning_at = start + TARGET - 300
+        self.tr.mark_alert_sent(4, 'five', warning_at)
+        self.tr.close()
+        self.tr = Tracker(Path(self.tmp.name) / 't.sqlite3')
+        self.assertEqual(self.tr.due_alerts(warning_at + 1), [])
+        done_at = start + TARGET
+        self.tr.mark_alert_sent(4, 'done', done_at)
+        self.tr.close()
+        self.tr = Tracker(Path(self.tmp.name) / 't.sqlite3')
+        self.assertEqual(self.tr.due_alerts(done_at + 1), [])
+
+    def test_pending_alert_deletion_survives_reopen(self):
+        start = ts('2026-10-15', 9)
+        self.tr.start(0, start)
+        warning_at = start + TARGET - 300
+        delete_at = warning_at + 600
+        self.tr.mark_alert_sent(
+            0,
+            'five',
+            warning_at,
+            chat_id=123,
+            message_id=456,
+            delete_at=delete_at,
+        )
+        self.assertEqual(self.tr.due_message_deletions(delete_at - 1), [])
+        self.tr.close()
+        self.tr = Tracker(Path(self.tmp.name) / 't.sqlite3')
+        self.assertEqual(self.tr.due_message_deletions(delete_at), [(123, 456)])
+        self.tr.forget_message_deletion(123, 456)
+        self.assertEqual(self.tr.due_message_deletions(delete_at + 1), [])
+
     def test_capped_at_reset_even_if_bot_was_offline(self):
         t = ts('2026-10-16', 6)
         self.tr.start(1, t)
@@ -106,6 +145,26 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(self.tr.unreported_day(new), '2026-10-15')
         self.tr.set_meta('last_day_reported', game_day(new))
         self.assertIsNone(self.tr.unreported_day(new))
+
+    def test_report_after_long_downtime_uses_latest_completed_day(self):
+        start = ts('2026-10-15', 8)
+        self.tr.init_day_marker(start)
+        after_downtime = ts('2026-10-19', 12)
+        self.assertEqual(self.tr.unreported_day(after_downtime), '2026-10-18')
+
+    def test_history_shows_current_week_by_days(self):
+        self.complete_character_day(self.tr, 0, '2026-10-14')
+        now = ts('2026-10-16', 8)
+        self.tr.initialize_week(now)
+        self.tr.buyout(1, '2026-10-15', now)
+        report = self.tr.history(now)
+        self.assertIn('Неделя: 14.10.2026 — 21.10.2026', report)
+        self.assertIn('14.10.2026 — награды 1/7', report)
+        self.assertIn('20.10.2026 — награды 0/7', report)
+        self.assertIn('Собрано наград: 1/49', report)
+        self.assertIn('Выкуплено дней: 1', report)
+        self.assertNotIn('Выкуп помогает', report)
+        self.assertNotIn('Ежедневная награда засчитывается', report)
 
 
     @staticmethod
@@ -149,6 +208,26 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(self.tr.token_balance(), 1000)
         self.assertEqual(self.tr.settle_weeks(ts('2026-10-21', 8)), [])
         self.assertEqual(self.tr.token_balance(), 1000)
+        previous = self.tr.history(ts('2026-10-21', 8), '2026-10-14')
+        self.assertIn('Получено токенов: 700', previous)
+
+    def test_weekly_awards_are_not_duplicated_after_reopen(self):
+        self.tr.initialize_week(ts('2026-10-14', 8))
+        self.tr.set_token_balance(0)
+        for day in week_days('2026-10-14'):
+            self.complete_character_day(self.tr, 0, day)
+        reset = ts('2026-10-21', 7)
+        self.assertEqual(self.tr.settle_weeks(reset), [('2026-10-14', 100)])
+        self.tr.close()
+        self.tr = Tracker(Path(self.tmp.name) / 't.sqlite3')
+        self.assertEqual(self.tr.settle_weeks(reset + 60), [])
+        self.assertEqual(self.tr.token_balance(), 100)
+        self.assertEqual(
+            self.tr.con.execute(
+                "SELECT COUNT(*) FROM token_ledger WHERE id='bonus:2026-10-14:0'"
+            ).fetchone()[0],
+            1,
+        )
 
     def test_buyout_is_for_one_character_one_failed_day_costs_50(self):
         first = ts('2026-10-14', 8)
@@ -162,7 +241,7 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(self.tr.week_stats(check)['forecast_bonus'], 0)
         self.assertIn('07:00', self.tr.buyout(0, '2026-10-20', check))
         self.assertEqual(self.tr.buyout(0, '2026-10-15', check),
-                         '✅ Выкуп 2026-10-15 для Эдгвин учтён (−50 токенов).')
+                         '✅ Выкуп 15.10.2026 для Маг Эдгвин учтён (−50 токенов).')
         self.assertEqual(self.tr.token_balance(), 150)
         self.assertTrue(self.tr.day_covered('2026-10-15', 0, check))
         self.assertFalse(self.tr.day_covered('2026-10-15', 1, check))
@@ -302,6 +381,67 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(self.tr.progress(4, boundary, '2026-10-15').elapsed, 90 * 60)
         self.assertEqual(self.tr.progress(4, boundary).elapsed, 0)
         self.assertFalse(self.tr.progress(4, boundary).running)
+
+    def test_normal_running_timer_persists_after_reopen(self):
+        start = ts('2026-10-15', 8)
+        self.tr.start(1, start)
+        self.tr.close()
+        self.tr = Tracker(Path(self.tmp.name) / 't.sqlite3')
+        restored = self.tr.progress(1, start + 47 * 60)
+        self.assertTrue(restored.running)
+        self.assertEqual(restored.elapsed, 47 * 60)
+
+    def test_completion_just_before_reset_can_be_claimed(self):
+        completion = ts('2026-10-16', 6, 59, 59)
+        self.tr.start(0, completion - TARGET)
+        self.assertTrue(self.tr.progress(0, completion).norm_done)
+        self.tr.reward(0, True, completion)
+        self.assertTrue(self.tr.progress(0, completion).fully_done)
+        self.assertFalse(self.tr.progress(0, ts('2026-10-16', 7)).fully_done)
+
+    def test_completion_exactly_at_reset_is_unclaimed_old_day(self):
+        reset = ts('2026-10-16', 7)
+        self.tr.start(0, reset - TARGET)
+        self.tr.close_expired(reset)
+        old = self.tr.progress(0, reset, '2026-10-15')
+        self.assertTrue(old.norm_done)
+        self.assertFalse(old.fully_done)
+        self.assertIn('награда НЕ забрана', self.tr.daily_report('2026-10-15'))
+        self.assertIn('Сначала нужно выполнить', self.tr.reward(0, True, reset))
+
+    def test_repeated_buttons_are_idempotent(self):
+        start = ts('2026-10-15', 8)
+        self.tr.start(0, start)
+        self.assertIn('уже на таймере', self.tr.start(0, start + 60))
+        self.tr.pause(0, start + 10 * 60)
+        self.assertIn('не на таймере', self.tr.pause(0, start + 11 * 60))
+        self.assertEqual(self.tr.progress(0, start + 11 * 60).elapsed, 10 * 60)
+        self.tr.manual(MAIN_INDEX, True, start)
+        self.tr.manual(MAIN_INDEX, True, start + 1)
+        self.tr.reward(MAIN_INDEX, True, start + 2)
+        self.tr.reward(MAIN_INDEX, True, start + 3)
+        self.assertTrue(self.tr.progress(MAIN_INDEX, start + 3).fully_done)
+
+    def test_old_progress_schema_is_migrated_without_data_loss(self):
+        self.tr.close()
+        path = Path(self.tmp.name) / 'old.sqlite3'
+        con = sqlite3.connect(path)
+        con.execute(
+            'CREATE TABLE progress ('
+            'day TEXT NOT NULL, character INTEGER NOT NULL, elapsed REAL NOT NULL DEFAULT 0, '
+            'started_at REAL, PRIMARY KEY(day, character))'
+        )
+        con.execute(
+            'INSERT INTO progress(day, character, elapsed, started_at) VALUES (?,?,?,NULL)',
+            ('2026-10-15', 2, 1800),
+        )
+        con.commit()
+        con.close()
+        self.tr = Tracker(path)
+        state = self.tr.progress(2, ts('2026-10-15', 9), '2026-10-15')
+        self.assertEqual(state.elapsed, 1800)
+        self.assertFalse(state.manual_done)
+        self.assertFalse(state.reward_received)
 
     def test_missed_week_does_not_retroactively_award_on_first_boot(self):
         now = ts('2026-10-21', 9)
