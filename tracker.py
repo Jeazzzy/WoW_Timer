@@ -83,9 +83,11 @@ class Progress:
     warned_five: bool = False
     notified_done: bool = False
 
+    manual_mode: bool = False
+
     @property
     def norm_done(self) -> bool:
-        return self.manual_done if self.character == MAIN_INDEX else self.elapsed >= TARGET
+        return self.manual_done if self.manual_mode else self.elapsed >= TARGET
 
     @property
     def fully_done(self) -> bool:
@@ -144,6 +146,23 @@ class Tracker:
                 PRIMARY KEY (chat_id, message_id)
             )
         """)
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS characters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                manual INTEGER NOT NULL DEFAULT 0,
+                position INTEGER NOT NULL,
+                added_day TEXT NOT NULL,
+                archived_day TEXT
+            )
+        """)
+        if self.get_meta("characters_migrated") is None:
+            self.con.executemany(
+                "INSERT INTO characters(id,name,manual,position,added_day) VALUES (?,?,?,?,?)",
+                [(i, name, int(i == MAIN_INDEX), i, "0001-01-01")
+                 for i, name in enumerate(CHARACTERS)],
+            )
+            self.set_meta("characters_migrated", "1")
         self._migrate_progress_table()
         self.con.execute(
             "CREATE INDEX IF NOT EXISTS buyouts_by_day ON buyouts(day)"
@@ -173,6 +192,78 @@ class Tracker:
                 self.con.execute(
                     f"ALTER TABLE progress ADD COLUMN {name} {definition}"
                 )
+
+    def characters(self, day: str | None = None) -> list[sqlite3.Row]:
+        if day is None:
+            return self.con.execute(
+                "SELECT * FROM characters WHERE archived_day IS NULL ORDER BY position,id"
+            ).fetchall()
+        return self.con.execute(
+            "SELECT * FROM characters WHERE added_day<=? "
+            "AND (archived_day IS NULL OR archived_day>?) ORDER BY position,id", (day, day)
+        ).fetchall()
+
+    def character(self, index: int) -> sqlite3.Row:
+        row = self.con.execute("SELECT * FROM characters WHERE id=?", (index,)).fetchone()
+        if row is None:
+            raise ValueError("Неизвестный персонаж")
+        return row
+
+    def is_active(self, index: int) -> bool:
+        return any(c["id"] == index for c in self.characters())
+
+    def name(self, index: int) -> str:
+        return str(self.character(index)["name"])
+
+    def is_manual(self, index: int) -> bool:
+        return bool(self.character(index)["manual"])
+
+    def add_character(self, name: str, manual: bool, now: float) -> int:
+        name = self.validate_name(name)
+        if len(self.characters()) >= 20:
+            raise ValueError("Можно добавить не больше 20 активных персонажей.")
+        position = self.con.execute("SELECT COALESCE(MAX(position),0)+1 FROM characters").fetchone()[0]
+        cursor = self.con.execute(
+            "INSERT INTO characters(name,manual,position,added_day) VALUES (?,?,?,?)",
+            (name, int(manual), position, game_day(now)),
+        )
+        self.con.commit()
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def validate_name(name: str) -> str:
+        name = " ".join(name.split())
+        if not 1 <= len(name) <= 60:
+            raise ValueError("Название должно содержать от 1 до 60 символов.")
+        return name
+
+    def rename_character(self, index: int, name: str) -> None:
+        self.character(index)
+        self.con.execute("UPDATE characters SET name=? WHERE id=?", (self.validate_name(name), index))
+        self.con.commit()
+
+    def move_character(self, index: int, direction: int) -> None:
+        rows = self.characters()
+        ids = [c["id"] for c in rows]
+        if index not in ids or direction not in (-1, 1):
+            raise ValueError("Неизвестный персонаж или направление")
+        old = ids.index(index)
+        new = old + direction
+        if 0 <= new < len(ids):
+            ids[old], ids[new] = ids[new], ids[old]
+            self.con.executemany("UPDATE characters SET position=? WHERE id=?", enumerate(ids))
+            self.con.commit()
+
+    def archive_character(self, index: int, now: float) -> None:
+        if not self.is_active(index):
+            return
+        if len(self.characters()) <= 1:
+            raise ValueError("Нельзя архивировать последнего персонажа.")
+        self._settle(game_day(now), index, now)
+        # Keep today's participation and all historical progress; hide from live menus.
+        self.con.execute("UPDATE characters SET archived_day=? WHERE id=?",
+                         ((date.fromisoformat(game_day(now)) + timedelta(days=1)).isoformat(), index))
+        self.con.commit()
 
     def close(self) -> None:
         self.con.close()
@@ -212,12 +303,12 @@ class Tracker:
         return min(float(TARGET), elapsed)
 
     def progress(self, index: int, now: float, day: str | None = None) -> Progress:
-        if not (0 <= index < len(CHARACTERS)):
-            raise ValueError("Неизвестный персонаж")
+        self.character(index)
         day = day or game_day(now)
         row = self._row(day, index)
         return Progress(
             character=index,
+            manual_mode=self.is_manual(index),
             elapsed=self._elapsed(row, day, now),
             running=bool(row and row["started_at"] is not None and day == game_day(now)
                          and self._elapsed(row, day, now) < TARGET),
@@ -228,7 +319,7 @@ class Tracker:
         )
 
     def all_progress(self, now: float, day: str | None = None) -> list[Progress]:
-        return [self.progress(i, now, day) for i in range(len(CHARACTERS))]
+        return [self.progress(c["id"], now, day) for c in self.characters(day)]
 
     def close_expired(self, now: float) -> None:
         """Finalize stale sessions strictly at their day's 07:00 boundary."""
@@ -256,10 +347,10 @@ class Tracker:
         )
 
     def start(self, index: int, now: float) -> str:
-        if index == MAIN_INDEX:
-            return "У Инферналя норма подтверждается вручную."
-        if not (0 <= index < len(CHARACTERS)):
+        if not self.is_active(index):
             return "Неизвестный персонаж."
+        if self.is_manual(index):
+            return "У этого персонажа норма подтверждается вручную."
         day = game_day(now)
         self.close_expired(now)
         if self.progress(index, now).norm_done:
@@ -271,7 +362,7 @@ class Tracker:
         for row in current:
             old_index = int(row["character"])
             if old_index == index:
-                return f"{CHARACTERS[index]} уже на таймере."
+                return f"{self.name(index)} уже на таймере."
             self._settle(day, old_index, now)
             switched = True
         self._ensure(day, index)
@@ -281,7 +372,7 @@ class Tracker:
         )
         self.con.commit()
         suffix = " Предыдущий таймер остановлен." if switched else ""
-        return f"▶️ Таймер запущен: {CHARACTERS[index]}.{suffix}"
+        return f"▶️ Таймер запущен: {self.name(index)}.{suffix}"
 
     def set_remaining(self, index: int, remaining_minutes: int, now: float) -> str:
         """Replace today's elapsed time and start a fresh countdown from ``now``.
@@ -289,10 +380,10 @@ class Tracker:
         Intended for correcting overcount after an unexpected WoW outage. This
         updates the same durable progress row as the normal Start/Pause buttons.
         """
-        if not 0 <= index < len(CHARACTERS):
+        if not self.is_active(index):
             return "Неизвестный персонаж."
-        if index == MAIN_INDEX:
-            return "У Инферналя норма подтверждается вручную."
+        if self.is_manual(index):
+            return "У этого персонажа норма подтверждается вручную."
         if type(remaining_minutes) is not int or not 0 <= remaining_minutes <= 120:
             return "Укажи целое число оставшихся минут от 0 до 120."
 
@@ -327,9 +418,9 @@ class Tracker:
         )
         self.con.commit()
         if remaining_minutes == 0:
-            return (f"✅ {CHARACTERS[index]}: 2 часа отмечены выполненными. "
+            return (f"✅ {self.name(index)}: 2 часа отмечены выполненными. "
                     "Не забудь подтвердить награду до 07:00 МСК.")
-        result = (f"⏱ {CHARACTERS[index]}: осталось {remaining_minutes} мин. "
+        result = (f"⏱ {self.name(index)}: осталось {remaining_minutes} мин. "
                   "Таймер запущен заново с текущего момента.")
         if now + remaining_minutes * 60 >= game_day_end(day):
             result += (" ⚠️ До сброса в 07:00 МСК не хватит времени "
@@ -343,11 +434,11 @@ class Tracker:
             return "Этот персонаж сейчас не на таймере."
         self._settle(day, index, now)
         self.con.commit()
-        return f"⏸ Таймер {CHARACTERS[index]} остановлен. Время сохранено."
+        return f"⏸ Таймер {self.name(index)} остановлен. Время сохранено."
 
     def manual(self, index: int, done: bool, now: float) -> str:
-        if index != MAIN_INDEX:
-            return "Ручная норма доступна только Инферналю."
+        if not self.is_manual(index):
+            return "У этого персонажа используется таймер."
         day = game_day(now)
         self._ensure(day, index)
         self.con.execute(
@@ -355,7 +446,7 @@ class Tracker:
             "WHERE day=? AND character=?", (int(done), int(done), day, index)
         )
         self.con.commit()
-        return "✅ Норма Инферналя отмечена." if done else "↩️ Отметка Инферналя отменена."
+        return f"✅ Норма {self.name(index)} отмечена." if done else f"↩️ Отметка {self.name(index)} отменена."
 
     def reward(self, index: int, received: bool, now: float) -> str:
         state = self.progress(index, now)
@@ -368,22 +459,25 @@ class Tracker:
             (int(received), day, index)
         )
         self.con.commit()
-        return (f"🎁 Награда отмечена: {CHARACTERS[index]}."
-                if received else f"↩️ Получение награды отменено: {CHARACTERS[index]}.")
+        return (f"🎁 Награда отмечена: {self.name(index)}."
+                if received else f"↩️ Получение награды отменено: {self.name(index)}.")
 
     def due_alerts(self, now: float) -> list[tuple[int, str, str]]:
         """Returns (character index, kind, text). Mark as sent *after* Telegram accepts it."""
         day = game_day(now)
         alerts: list[tuple[int, str, str]] = []
-        for i in range(MAIN_INDEX):
+        for character in self.characters():
+            i = character["id"]
+            if character["manual"]:
+                continue
             row = self._row(day, i)
             if not row:
                 continue
             state = self.progress(i, now)
             if state.norm_done and not state.notified_done:
-                alerts.append((i, "done", f"✅ {CHARACTERS[i]}: 2 часа выполнены! Не забудь забрать награду до 07:00 МСК."))
+                alerts.append((i, "done", f"✅ {self.name(i)}: 2 часа выполнены! Не забудь забрать награду до 07:00 МСК."))
             elif state.running and state.elapsed >= TARGET - FIVE_MIN and not state.warned_five:
-                alerts.append((i, "five", f"⏳ {CHARACTERS[i]}: осталось 5 минут до нормы!"))
+                alerts.append((i, "five", f"⏳ {self.name(i)}: осталось 5 минут до нормы!"))
         return alerts
 
     def mark_alert_sent(
@@ -446,16 +540,16 @@ class Tracker:
         # The day has already ended; progress() automatically caps stale sessions.
         end = game_day_end(day)
         rows = self.all_progress(end, day)
-        completed = [CHARACTERS[s.character] for s in rows if s.fully_done]
+        completed = [self.name(s.character) for s in rows if s.fully_done]
         lines = [f"📅 Итоги игровых суток {human_date(day)} (07:00 МСК)",
-                 f"Полностью выполнено: {len(completed)}/7", ""]
+                 f"Полностью выполнено: {len(completed)}/{len(rows)}", ""]
         for state in rows:
-            name = CHARACTERS[state.character]
+            name = self.name(state.character)
             if state.fully_done:
                 lines.append(f"✅ {name} — норма + награда")
             elif state.norm_done:
                 lines.append(f"❌ {name} — норма есть, награда НЕ забрана")
-            elif state.character == MAIN_INDEX:
+            elif self.is_manual(state.character):
                 lines.append(f"❌ {name} — ручная норма не отмечена")
             else:
                 lines.append(f"❌ {name} — {clock_hm(state.elapsed)}/02:00")
@@ -475,16 +569,18 @@ class Tracker:
         days = week_days(week)
         lines = [f"📊 Неделя: {human_date(week)} — {human_date(next_week(week))}"]
         collected = 0
+        possible = 0
         for day in days:
             states = self.all_progress(min(now, game_day_end(day)), day)
             rewards = sum(state.fully_done for state in states)
             collected += rewards
-            lines.append(f"{human_date(day)} — награды {rewards}/7")
+            possible += len(states)
+            lines.append(f"{human_date(day)} — награды {rewards}/{len(states)}")
         bought = int(self.con.execute(
             "SELECT COUNT(*) FROM buyouts WHERE day>=? AND day<?",
             (week, next_week(week)),
         ).fetchone()[0])
-        lines.extend(["", f"Собрано наград: {collected}/49", f"Выкуплено дней: {bought}"])
+        lines.extend(["", f"Собрано наград: {collected}/{possible}", f"Выкуплено дней: {bought}"])
         if week < game_week(now):
             lines.append(f"Получено токенов: {self.week_tokens_received(week)}")
         return "\n".join(lines)
@@ -520,10 +616,12 @@ class Tracker:
         Only closed, failed days of the current week can be bought.
         A unique key makes a repeated Telegram callback idempotent.
         """
-        if not 0 <= index < len(CHARACTERS):
+        if not self.is_active(index):
             return "Неизвестный персонаж."
         if day not in week_days(game_week(now)):
             return "Этот день не входит в текущую игровую неделю."
+        if not any(c["id"] == index for c in self.characters(day)):
+            return "В этот день персонаж ещё не участвовал."
         if day >= game_day(now):
             return "Этот игровой день ещё не закончился: дождись сброса в 07:00 МСК."
         if self.was_bought(day, index):
@@ -537,10 +635,10 @@ class Tracker:
         self.con.execute(
             "INSERT INTO token_ledger(id, created_at, amount, description) VALUES (?,?,?,?)",
             (f"buyout:{day}:{index}", now, -BUYOUT_COST,
-             f"Выкуп {day}: {CHARACTERS[index]}")
+             f"Выкуп {day}: {self.name(index)}")
         )
         self.con.commit()
-        return (f"✅ Выкуп {human_date(day)} для {CHARACTERS[index]} "
+        return (f"✅ Выкуп {human_date(day)} для {self.name(index)} "
                 f"учтён (−{BUYOUT_COST} токенов).")
 
     def token_balance(self) -> int | None:
@@ -572,14 +670,22 @@ class Tracker:
         today = game_day(now)
         days = week_days(week)
         characters = []
-        for i, name in enumerate(CHARACTERS):
-            complete_days = [day for day in days if self.day_covered(day, i, now)]
-            missed_days = [day for day in days if day < today and day not in complete_days]
+        participants = self.con.execute(
+            "SELECT * FROM characters WHERE added_day<? "
+            "AND (archived_day IS NULL OR archived_day>?) ORDER BY position,id",
+            (next_week(week), week),
+        ).fetchall()
+        for character in participants:
+            i, name = character["id"], character["name"]
+            eligible = [day for day in days if day >= character["added_day"]
+                        and (character["archived_day"] is None or day < character["archived_day"])]
+            complete_days = [day for day in eligible if self.day_covered(day, i, now)]
+            missed_days = [day for day in eligible if day < today and day not in complete_days]
             bought_days = [day for day in days if self.was_bought(day, i)]
             earned = WEEKLY_REWARD if len(complete_days) == 7 else 0
-            forecast = WEEKLY_REWARD if not missed_days else 0
+            forecast = WEEKLY_REWARD if not missed_days and len(eligible) == 7 else 0
             characters.append({
-                "index": i, "name": name, "covered": len(complete_days),
+                "index": i, "name": name, "covered": len(complete_days), "eligible": eligible,
                 "missed": missed_days, "bought": bought_days,
                 "earned": earned, "forecast": forecast,
             })
@@ -594,7 +700,7 @@ class Tracker:
             "forecast_net": predicted - expenses,
             "actual_bonus": sum(c["earned"] for c in characters),
             "missed_count": sum(len(c["missed"]) for c in characters),
-            "net_if_all_bought": 7 * WEEKLY_REWARD - expenses
+            "net_if_all_bought": sum(len(c["eligible"]) == 7 for c in characters) * WEEKLY_REWARD - expenses
                 - BUYOUT_COST * sum(len(c["missed"]) for c in characters),
         }
 

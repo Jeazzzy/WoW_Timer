@@ -12,12 +12,13 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 from tracker import (
-    CHARACTERS, MAIN_INDEX, TARGET, BUYOUT_COST, Tracker, clock_hm, game_day,
+    TARGET, BUYOUT_COST, Tracker, clock_hm, game_day,
     game_week, human_date, next_week, previous_week, week_day_number,
 )
 
@@ -32,10 +33,16 @@ DB_PATH = Path(os.getenv("DB_PATH", "data/tracker.sqlite3"))
 if not DB_PATH.is_absolute():
     DB_PATH = BASE_DIR / DB_PATH
 ALERT_DELETE_DELAY = 10 * 60
+MENU_REFRESH_INTERVAL = 60
 
 router = Router()
 tracker: Tracker
 owner_id = 0
+panel_lock = asyncio.Lock()
+
+
+class CharacterInput(StatesGroup):
+    name = State()
 
 
 class RemainingInput(StatesGroup):
@@ -48,12 +55,13 @@ def is_owner(user_id: int | None) -> bool:
 
 def markup_home():
     b = InlineKeyboardBuilder()
-    for i, character in enumerate(CHARACTERS):
-        b.button(text=character, callback_data=f"view:char:{i}")
+    for character in tracker.characters():
+        b.button(text=character["name"], callback_data=f"view:char:{character['id']}")
     b.button(text="🎁 Награды", callback_data="view:rewards")
     b.button(text="📊 История", callback_data="view:history")
     b.button(text="🔄 Обновить", callback_data="view:home")
-    b.adjust(*([1] * 7), 2, 1)
+    b.button(text="⚙️ Персонажи", callback_data="view:settings")
+    b.adjust(*([1] * len(tracker.characters())), 2, 1, 1)
     return b.as_markup()
 
 
@@ -61,7 +69,7 @@ def markup_char(index: int, now: float):
     p = tracker.progress(index, now)
     day = game_day(now)
     b = InlineKeyboardBuilder()
-    if index == MAIN_INDEX:
+    if tracker.is_manual(index):
         if p.manual_done:
             b.button(text="↩️ Отменить норму", callback_data=f"action:manual_off:{index}:{day}")
         else:
@@ -71,7 +79,7 @@ def markup_char(index: int, now: float):
             b.button(text="⏸ Остановить таймер", callback_data=f"action:pause:{index}:{day}")
         else:
             b.button(text="▶️ Начать / продолжить", callback_data=f"action:start:{index}:{day}")
-    if index != MAIN_INDEX and not p.reward_received:
+    if not tracker.is_manual(index) and not p.reward_received:
         b.button(text="⏱ Установить остаток (мин)",
                  callback_data=f"action:remaining:{index}:{day}")
     if p.norm_done:
@@ -93,7 +101,7 @@ def markup_rewards(now: float):
             continue
         action = "reward_off" if p.reward_received else "reward_on"
         symbol = "✅" if p.reward_received else "🎁"
-        b.button(text=f"{symbol} {CHARACTERS[p.character]}",
+        b.button(text=f"{symbol} {tracker.name(p.character)}",
                  callback_data=f"action:{action}:{p.character}:{day}")
     b.button(text="🔄 Обновить", callback_data="view:rewards")
     b.button(text="⬅️ К списку", callback_data="view:home")
@@ -120,7 +128,7 @@ def markup_buyouts(now: float):
     b = InlineKeyboardBuilder()
     stats = tracker.week_stats(now)
     for char in stats["characters"]:
-        if char["missed"]:
+        if char["missed"] and tracker.is_active(char["index"]):
             b.button(text=char["name"], callback_data=f"view:weekchar:{char['index']}")
     b.button(text="⬅️ К истории", callback_data="view:history")
     b.adjust(1)
@@ -130,7 +138,7 @@ def markup_buyouts(now: float):
 def markup_weekchar(index: int, now: float):
     b = InlineKeyboardBuilder()
     stats = tracker.week_stats(now)
-    char = stats["characters"][index]
+    char = next(c for c in stats["characters"] if c["index"] == index)
     for day in char["missed"]:
         b.button(text=f"💳 Отметить выкуп {human_date(day)} (−{BUYOUT_COST})",
                  callback_data=f"buy:confirm:{index}:{day}")
@@ -167,14 +175,14 @@ def home_text(now: float) -> str:
     total_done = sum(p.fully_done for p in rows)
     lines = ["🎮 WoW Tracker", f"Игровые сутки: {human_date(day)}",
              f"Неделя: {human_date(week)} — {human_date(next_week(week))}"]
-    lines.extend([f"День {week_day_number(now)}", f"Закрыто: {total_done}/7"])
+    lines.extend([f"День {week_day_number(now)}", f"Закрыто: {total_done}/{len(rows)}"])
     balance = tracker.token_balance()
     if balance is not None:
         lines.append(f"Учётный баланс сейчас: {balance}")
     lines.append("")
     for p in rows:
-        name = CHARACTERS[p.character]
-        if p.character == MAIN_INDEX:
+        name = tracker.name(p.character)
+        if tracker.is_manual(p.character):
             desc = "ручная отметка"
         else:
             desc = (f"{clock_hm(p.elapsed)}/02:00 — осталось "
@@ -186,8 +194,8 @@ def home_text(now: float) -> str:
 
 def character_text(index: int, now: float) -> str:
     p = tracker.progress(index, now)
-    lines = [f"🎮 {CHARACTERS[index]}", f"Игровые сутки: {human_date(game_day(now))}", ""]
-    if index == MAIN_INDEX:
+    lines = [f"🎮 {tracker.name(index)}", f"Игровые сутки: {human_date(game_day(now))}", ""]
+    if tracker.is_manual(index):
         lines.append(f"Норма: {'✅ Отмечена вручную' if p.manual_done else '▫️ Не отмечена'}")
         lines.append("Таймер и уведомления отключены.")
     else:
@@ -204,7 +212,7 @@ def rewards_text(now: float) -> str:
     lines = ["🎁 Награды за игровые сутки " + human_date(game_day(now)), ""]
     for p in rows:
         label = "✅ Получена" if p.reward_received else "🎁 Можно отметить" if p.norm_done else "🔒 Сначала норма"
-        lines.append(f"{CHARACTERS[p.character]} — {label}")
+        lines.append(f"{tracker.name(p.character)} — {label}")
     lines.extend(["", "Неполученные до 07:00 МСК награды сгорают.",
                   "Кнопки появятся, когда выполнена норма."])
     return "\n".join(lines)
@@ -219,12 +227,14 @@ def buyouts_text(now: float) -> str:
 
 def weekchar_text(index: int, now: float) -> str:
     stats = tracker.week_stats(now)
-    char = stats["characters"][index]
+    char = next(c for c in stats["characters"] if c["index"] == index)
     today = game_day(now)
     lines = [f"💳 {char['name']} — неделя {human_date(stats['week'])}",
              f"Закрыто: {char['covered']}/7; выкуплено: {len(char['bought'])}", ""]
     for day in stats["days"]:
-        if tracker.was_bought(day, index):
+        if day not in char["eligible"]:
+            state = "▫️ Не участвовал"
+        elif tracker.was_bought(day, index):
             state = "💳 Выкуплен (−50)"
         elif tracker.day_covered(day, index, now):
             state = "✅ Время + награда"
@@ -241,7 +251,38 @@ def weekchar_text(index: int, now: float) -> str:
     return "\n".join(lines)
 
 
+def settings_screen(index: int | None = None):
+    b = InlineKeyboardBuilder()
+    if index is None:
+        lines = ["⚙️ Персонажи", "Выбери персонажа для изменения порядка или названия."]
+        for c in tracker.characters():
+            b.button(text=c["name"], callback_data=f"view:settings:{c['id']}")
+        b.button(text="➕ Добавить", callback_data="manage:add")
+    else:
+        c = tracker.character(index)
+        lines = [f"⚙️ {c['name']}", "Режим: " + ("ручная отметка" if c["manual"] else "таймер 2 часа")]
+        ids = [c["id"] for c in tracker.characters()]
+        if ids.index(index) > 0:
+            b.button(text="↑ Выше", callback_data=f"manage:up:{index}")
+        if ids.index(index) < len(ids) - 1:
+            b.button(text="↓ Ниже", callback_data=f"manage:down:{index}")
+        b.button(text="✏️ Переименовать", callback_data=f"manage:rename:{index}")
+        b.button(text="📦 Архивировать", callback_data=f"manage:archive:{index}")
+        b.button(text="⬅️ Персонажи", callback_data="view:settings")
+    b.button(text="⬅️ На главную", callback_data="view:home")
+    b.adjust(1)
+    return "\n".join(lines), b.as_markup()
+
+
+def cancel_markup():
+    b = InlineKeyboardBuilder()
+    b.button(text="Отмена", callback_data="view:home")
+    return b.as_markup()
+
+
 def screen(view: str, now: float, index: int | None = None):
+    if view == "settings":
+        return settings_screen(index)
     if view == "char" and index is not None:
         return character_text(index, now), markup_char(index, now)
     if view == "rewards":
@@ -260,22 +301,93 @@ def screen(view: str, now: float, index: int | None = None):
     return home_text(now), markup_home()
 
 
+async def delete_message(bot: Bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except TelegramBadRequest as ex:
+        # Telegram cannot remove messages older than its deletion window.
+        if not any(reason in str(ex).lower() for reason in
+                   ("message to delete not found", "message can't be deleted")):
+            raise
+
+
+async def _panel(bot: Bot, text: str, markup) -> None:
+    saved = tracker.get_meta("menu_message_id")
+    if saved:
+        try:
+            await bot.edit_message_text(chat_id=owner_id, message_id=int(saved),
+                                        text=text, reply_markup=markup)
+            return
+        except TelegramBadRequest as ex:
+            if "message is not modified" in str(ex):
+                return
+            if not any(reason in str(ex).lower() for reason in
+                       ("message to edit not found", "message can't be edited")):
+                raise
+            await delete_message(bot, owner_id, int(saved))
+    message = await bot.send_message(owner_id, text, reply_markup=markup)
+    tracker.set_meta("menu_message_id", str(message.message_id))
+
+
+async def show_panel(bot: Bot, view="home", index=None, notice=None, text=None, markup=None):
+    async with panel_lock:
+        now = time.time()
+        tracker.close_expired(now)
+        tracker.settle_weeks(now)
+        refresh_view = view if text is None and view != "settings" else ""
+        if text is None:
+            text, markup = screen(view, now, index)
+        if notice:
+            text = notice + "\n\n" + text
+        await _panel(bot, text, markup)
+        remember_panel(refresh_view, index, now)
+
+
+def remember_panel(view: str, index: int | None, now: float) -> None:
+    with tracker.con:
+        tracker.con.executemany(
+            "INSERT INTO metadata(key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [("menu_view", view), ("menu_index", "" if index is None else str(index)),
+             ("menu_refreshed_at", str(now)),
+             ("menu_timer_running", str(int(any(p.running for p in tracker.all_progress(now)))))],
+        )
+
+
+async def refresh_panel(bot: Bot, now: float) -> None:
+    async with panel_lock:
+        view = tracker.get_meta("menu_view")
+        if not view or not tracker.get_meta("menu_message_id"):
+            return
+        last = float(tracker.get_meta("menu_refreshed_at") or 0)
+        if now - last < MENU_REFRESH_INTERVAL:
+            return
+        running = any(p.running for p in tracker.all_progress(now))
+        # Refresh once more at completion, even after mark_alert_sent stops the timer.
+        if not running and tracker.get_meta("menu_timer_running") != "1":
+            return
+        raw_index = tracker.get_meta("menu_index")
+        index = int(raw_index) if raw_index else None
+        if index is not None and not tracker.is_active(index):
+            view, index = "home", None
+        text, markup = screen(view, now, index)
+        await _panel(bot, text, markup)
+        remember_panel(view, index, now)
+
+
+async def respond_screen(message: Message, view: str, index=None, notice=None):
+    await delete_message(message.bot, message.chat.id, message.message_id)
+    await show_panel(message.bot, view, index, notice)
+
+
+async def respond(message: Message, text: str, reply_markup=None):
+    await delete_message(message.bot, message.chat.id, message.message_id)
+    await show_panel(message.bot, text=text, markup=reply_markup or cancel_markup())
+
+
 async def redraw(callback: CallbackQuery, view: str, index: int | None = None,
                  notice: str | None = None) -> None:
-    now = time.time()
-    tracker.close_expired(now)
-    tracker.settle_weeks(now)
-    text, markup = screen(view, now, index)
-    if notice:
-        text = notice + "\n\n" + text
-    if isinstance(callback.message, Message):
-        try:
-            await callback.message.edit_text(text, reply_markup=markup)
-        except TelegramBadRequest as ex:
-            if "message is not modified" not in str(ex):
-                raise
-    else:
-        await callback.bot.send_message(owner_id, text, reply_markup=markup)
+    await show_panel(callback.bot, view, index, notice)
 
 
 @router.message(CommandStart())
@@ -286,8 +398,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     now = time.time()
     tracker.close_expired(now)
-    text, markup = screen("home", now)
-    await message.answer(text, reply_markup=markup)
+    await respond_screen(message, "home")
 
 
 @router.message(Command("rewards"))
@@ -296,8 +407,7 @@ async def cmd_rewards(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     now = time.time()
-    text, markup = screen("rewards", now)
-    await message.answer(text, reply_markup=markup)
+    await respond_screen(message, "rewards")
 
 
 @router.message(Command("week"))
@@ -307,8 +417,7 @@ async def cmd_week(message: Message, state: FSMContext) -> None:
     await state.clear()
     now = time.time()
     tracker.settle_weeks(now)
-    text, markup = screen("history", now)
-    await message.answer(text, reply_markup=markup)
+    await respond_screen(message, "history")
 
 
 @router.message(Command("balance"))
@@ -319,15 +428,15 @@ async def cmd_balance(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip().split()
     if len(raw) == 1:
         balance = tracker.token_balance()
-        await message.answer("Баланс ещё не указан. Введи /balance 250" if balance is None
+        await respond(message, "Баланс ещё не указан. Введи /balance 250" if balance is None
                              else f"Учётный баланс: {balance} токенов. Для коррекции: /balance 250")
         return
     if len(raw) != 2 or not raw[1].isdigit():
-        await message.answer("Формат: /balance 250 (фактический баланс токенов в игре)")
+        await respond(message, "Формат: /balance 250 (фактический баланс токенов в игре)")
         return
     tracker.settle_weeks(time.time())
     tracker.set_token_balance(int(raw[1]))
-    await message.answer(f"✅ Баланс синхронизирован с игрой: {int(raw[1])} токенов. "
+    await respond(message, f"✅ Баланс синхронизирован с игрой: {int(raw[1])} токенов. "
                          "Последующие выкупы и недельные начисления бот учитывает автоматически.")
 
 
@@ -337,8 +446,7 @@ async def cmd_history(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     now = time.time()
-    text, markup = screen("history", now)
-    await message.answer(text, reply_markup=markup)
+    await respond_screen(message, "history")
 
 
 @router.message(Command("help"))
@@ -346,7 +454,7 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id if message.from_user else None):
         return
     await state.clear()
-    await message.answer(
+    await respond(message,
         "Команды: /start, /status, /rewards, /history, /balance [число], /cancel, /help.\n\n"
         "Выбери персонажа и нажми ▶️, когда зайдёшь в игру. "
         "На паузе время не растёт. При запуске другого чара старый таймер автоматически останавливается.\n\n"
@@ -359,7 +467,8 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
         "Недельный прогресс и прошлая неделя находятся в разделе «История». "
         "Пропущенный день можно отметить как выкупленный там после покупки в игре. "
         "Баланс можно задать командой /balance 250.\n\n"
-        "Инферналь: ручная норма и отдельная награда, без таймера и уведомлений. "
+        "В «⚙️ Персонажи» можно менять порядок, добавлять, переименовывать и архивировать персонажей. "
+        "Ручная норма — без таймера и уведомлений. "
         "Бот не считывает фактический онлайн из WoW: всё учитывается по твоим нажатиям."
     )
 
@@ -370,8 +479,8 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         return
     active = await state.get_state()
     await state.clear()
-    await message.answer("Ввод оставшихся минут отменён." if active else
-                         "Сейчас нет ожидающего ввода.")
+    await delete_message(message.bot, message.chat.id, message.message_id)
+    await show_panel(message.bot, notice="Ввод отменён." if active else "Сейчас нет ожидающего ввода.")
 
 
 @router.message(RemainingInput.waiting_minutes)
@@ -380,11 +489,11 @@ async def receive_remaining(message: Message, state: FSMContext) -> None:
         return
     raw = (message.text or "").strip()
     if len(raw) > 3 or not raw.isascii() or not raw.isdecimal():
-        await message.answer("Пришли целое число от 0 до 120 (например, 37). Или /cancel.")
+        await respond(message, "Пришли целое число от 0 до 120 (например, 37). Или /cancel.")
         return
     minutes = int(raw)
     if not 0 <= minutes <= 120:
-        await message.answer("Допустимо от 0 до 120 минут. Пример: 37. Или /cancel.")
+        await respond(message, "Допустимо от 0 до 120 минут. Пример: 37. Или /cancel.")
         return
     data = await state.get_data()
     index = data.get("index")
@@ -392,16 +501,38 @@ async def receive_remaining(message: Message, state: FSMContext) -> None:
     await state.clear()
     now = time.time()
     tracker.close_expired(now)
-    if not isinstance(index, int) or not 0 <= index < len(CHARACTERS):
-        await message.answer("Персонаж не выбран. Открой /start и попробуй ещё раз.")
+    if not isinstance(index, int) or not tracker.is_active(index):
+        await respond(message, "Персонаж не выбран. Открой /start и попробуй ещё раз.")
         return
     if day != game_day(now):
-        await message.answer("Уже наступил новый игровой день (07:00 МСК). "
+        await respond(message, "Уже наступил новый игровой день (07:00 МСК). "
                              "Старый таймер менять нельзя. Выбери персонажа заново.")
         return
     result = tracker.set_remaining(index, minutes, now)
-    text, keyboard = screen("char", now, index)
-    await message.answer(result + "\n\n" + text, reply_markup=keyboard)
+    await respond_screen(message, "char", index, notice=result)
+
+
+@router.message(CharacterInput.name)
+async def receive_character_name(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id if message.from_user else None):
+        return
+    data = await state.get_data()
+    try:
+        if "index" in data:
+            index = data["index"]
+            if not tracker.is_active(index):
+                await state.clear()
+                await respond(message, "Персонаж уже архивирован.")
+                return
+            tracker.rename_character(index, message.text or "")
+        else:
+            index = tracker.add_character(message.text or "", data["manual"], time.time())
+    except ValueError as ex:
+        await respond(message, str(ex))
+        return
+    await state.clear()
+    text, markup = settings_screen(index)
+    await respond(message, text, markup)
 
 
 @router.callback_query()
@@ -409,6 +540,20 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
+    async def inline_answer(text=None, show_alert=False):
+        await callback.answer()
+        if text:
+            await show_panel(callback.bot, notice=text)
+
+    # Remember the pre-upgrade menu, including when its first action is a prompt.
+    async with panel_lock:
+        if isinstance(callback.message, Message):
+            saved = tracker.get_meta("menu_message_id")
+            if not saved:
+                tracker.set_meta("menu_message_id", str(callback.message.message_id))
+            elif int(saved) != callback.message.message_id:
+                await delete_message(callback.bot, owner_id, callback.message.message_id)
+
     data = callback.data or ""
     parts = data.split(":")
     now = time.time()
@@ -416,14 +561,55 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
     tracker.settle_weeks(now)
     # Navigating to another screen/action cancels an unfinished minutes prompt.
     await state.clear()
-    if len(parts) >= 2 and parts[0] == "view":
+    if parts[0] == "manage":
         await callback.answer()
+        try:
+            operation = parts[1]
+            if operation == "add":
+                b = InlineKeyboardBuilder()
+                b.button(text="⏱ Таймер 2 часа", callback_data="manage:new:timer")
+                b.button(text="✅ Ручная отметка", callback_data="manage:new:manual")
+                b.button(text="Отмена", callback_data="view:settings")
+                b.adjust(1)
+                await show_panel(callback.bot, text="Выбери режим нового персонажа:", markup=b.as_markup())
+                return
+            if operation == "new" and parts[2] in ("timer", "manual"):
+                await state.set_state(CharacterInput.name)
+                await state.update_data(manual=parts[2] == "manual")
+                await show_panel(callback.bot, text="Введи название персонажа (1–60 символов).", markup=cancel_markup())
+                return
+            index = int(parts[2])
+            if not tracker.is_active(index):
+                raise ValueError("Персонаж уже архивирован.")
+            if operation in ("up", "down"):
+                tracker.move_character(index, -1 if operation == "up" else 1)
+                await redraw(callback, "settings", index)
+            elif operation == "rename":
+                await state.set_state(CharacterInput.name)
+                await state.update_data(index=index)
+                await show_panel(callback.bot, text="Введи новое название (1–60 символов).", markup=cancel_markup())
+            elif operation == "archive":
+                b = InlineKeyboardBuilder()
+                b.button(text="📦 Да, архивировать", callback_data=f"manage:archive_yes:{index}")
+                b.button(text="Отмена", callback_data=f"view:settings:{index}")
+                b.adjust(1)
+                await show_panel(callback.bot, text=f"Архивировать {tracker.name(index)}? История сохранится, таймер остановится.", markup=b.as_markup())
+            elif operation == "archive_yes":
+                tracker.archive_character(index, now)
+                await redraw(callback, "settings")
+            else:
+                raise ValueError("Неизвестная операция")
+        except (ValueError, IndexError) as ex:
+            await show_panel(callback.bot, "settings", notice=str(ex))
+        return
+    if len(parts) >= 2 and parts[0] == "view":
+        await inline_answer()
         view = parts[1]
         index = None
-        if view in ("char", "weekchar") and len(parts) == 3:
+        if view in ("char", "weekchar", "settings") and len(parts) == 3:
             try:
                 index = int(parts[2])
-                if not 0 <= index < len(CHARACTERS):
+                if not tracker.is_active(index):
                     raise ValueError
             except ValueError:
                 await redraw(callback, "home")
@@ -434,65 +620,61 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
         _, kind, index_text, day = parts
         try:
             index = int(index_text)
-            if not 0 <= index < len(CHARACTERS):
+            if not tracker.is_active(index):
                 raise ValueError
         except ValueError:
-            await callback.answer("Некорректный персонаж", show_alert=True)
+            await inline_answer("Некорректный персонаж", show_alert=True)
             return
         if day not in tracker.week_stats(now)["days"] or day >= game_day(now):
-            await callback.answer("Выкупать можно только прошлые дни текущей недели", show_alert=True)
-            await redraw(callback, "weekchar", index)
+            await callback.answer()
+            await redraw(callback, "weekchar", index,
+                         notice="Выкупать можно только прошлые дни текущей недели")
             return
         if kind == "confirm":
             if tracker.day_covered(day, index, now):
-                await callback.answer("Этот день уже закрыт", show_alert=True)
-                await redraw(callback, "weekchar", index)
+                await callback.answer()
+                await redraw(callback, "weekchar", index, notice="Этот день уже закрыт")
                 return
-            await callback.answer()
-            text = (f"Подтвердить учёт выкупа?\n\n{CHARACTERS[index]} — {human_date(day)}\n"
+            await inline_answer()
+            text = (f"Подтвердить учёт выкупа?\n\n{tracker.name(index)} — {human_date(day)}\n"
                     f"Стоимость: −{BUYOUT_COST} токенов.\n\n"
                     "Подтверждай только после фактической покупки в игре. Отмены расхода нет.")
-            if isinstance(callback.message, Message):
-                await callback.message.edit_text(text, reply_markup=markup_buy_confirm(index, day))
+            await show_panel(callback.bot, text=text, markup=markup_buy_confirm(index, day))
             return
         if kind == "apply":
             result = tracker.buyout(index, day, now)
-            await callback.answer()
+            await inline_answer()
             await redraw(callback, "weekchar", index, notice=result)
             return
-        await callback.answer("Неизвестная операция", show_alert=True)
+        await inline_answer("Неизвестная операция", show_alert=True)
         return
     if len(parts) == 4 and parts[0] == "action":
         action, index_text, day = parts[1:]
         try:
             index = int(index_text)
-            if not 0 <= index < len(CHARACTERS):
+            if not tracker.is_active(index):
                 raise ValueError
         except ValueError:
-            await callback.answer("Некорректный персонаж", show_alert=True)
+            await inline_answer("Некорректный персонаж", show_alert=True)
             return
         if day != game_day(now):
-            await callback.answer("Это кнопка прошлого игрового дня", show_alert=True)
-            await redraw(callback, "home")
+            await callback.answer()
+            await redraw(callback, "home", notice="Это кнопка прошлого игрового дня")
             return
         if action == "remaining":
-            if index == MAIN_INDEX:
-                await callback.answer("У Инферналя нет таймера", show_alert=True)
+            if tracker.is_manual(index):
+                await inline_answer("У этого персонажа нет таймера", show_alert=True)
                 return
             if tracker.progress(index, now).reward_received:
-                await callback.answer("Награда уже отмечена. Правка недоступна", show_alert=True)
+                await inline_answer("Награда уже отмечена. Правка недоступна", show_alert=True)
                 return
             await state.set_state(RemainingInput.waiting_minutes)
             await state.update_data(index=index, day=day)
-            await callback.answer()
-            await callback.bot.send_message(
-                owner_id,
-                f"⏱ {CHARACTERS[index]} — введи, сколько минут осталось до 2 часов "
-                "(целое число от 0 до 120).\n\n"
-                "Например, 37 → таймер на 37 минут с момента твоего ответа. "
-                "0 → сразу завершить норму, 120 → начать отсчёт заново.\n"
-                "Чтобы отменить, напиши /cancel."
-            )
+            await inline_answer()
+            await show_panel(
+                callback.bot, text=f"⏱ {tracker.name(index)} — введи оставшиеся минуты (0–120).\n\n"
+                "Например, 37 — запустить таймер на 37 минут. 0 — норма выполнена.\n"
+                "Отмена — кнопкой ниже или /cancel.", markup=cancel_markup())
             return
         if action == "start":
             result = tracker.start(index, now)
@@ -503,15 +685,50 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
         elif action in {"reward_on", "reward_off"}:
             result = tracker.reward(index, action == "reward_on", now)
         else:
-            await callback.answer("Неизвестная команда", show_alert=True)
+            await inline_answer("Неизвестная команда", show_alert=True)
             return
-        await callback.answer()
+        await inline_answer()
         if action.startswith("reward"):
             await redraw(callback, "rewards", notice=result)
         else:
             await redraw(callback, "char", index, notice=result)
         return
-    await callback.answer("Неизвестная кнопка", show_alert=True)
+    await inline_answer("Неизвестная кнопка", show_alert=True)
+
+
+@router.message()
+async def receive_other(message: Message):
+    if is_owner(message.from_user.id if message.from_user else None):
+        await delete_message(message.bot, message.chat.id, message.message_id)
+        await show_panel(message.bot)
+
+
+async def publish_daily_report(bot: Bot, now: float) -> None:
+    async with panel_lock:
+        day = tracker.unreported_day(now)
+        if day is not None:
+            # Persist intermediate state so a failed send/restart resumes without duplicate reports.
+            if tracker.get_meta("report_day") != day:
+                old = tracker.get_meta("report_message_id")
+                if old:
+                    await delete_message(bot, owner_id, int(old))
+                message = await bot.send_message(owner_id, tracker.daily_report(day))
+                with tracker.con:
+                    tracker.con.executemany(
+                        "INSERT INTO metadata(key,value) VALUES (?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        [("report_message_id", str(message.message_id)), ("report_day", day)],
+                    )
+            menu = tracker.get_meta("menu_message_id")
+            if menu:
+                await delete_message(bot, owner_id, int(menu))
+                tracker.set_meta("menu_message_id", "")
+            text, markup = screen("home", now)
+            await _panel(bot, text, markup)
+            remember_panel("home", None, now)
+            tracker.set_meta("last_day_reported", game_day(now))
+        # Weekly results remain in History; settlement still runs normally.
+        tracker.set_meta("last_week_reported", game_week(now))
 
 
 async def worker(bot: Bot) -> None:
@@ -521,21 +738,9 @@ async def worker(bot: Bot) -> None:
             now = time.time()
             tracker.close_expired(now)
             tracker.settle_weeks(now)
-            week_to_report = tracker.unreported_week(now)
-            if week_to_report is not None:
-                await bot.send_message(owner_id, tracker.weekly_report(week_to_report, now))
-                tracker.set_meta("last_week_reported", game_week(now))
-            day_to_report = tracker.unreported_day(now)
-            if day_to_report is not None:
-                # If the bot was offline for several days, show the most recent
-                # recorded day, rather than sending multiple historical alerts.
-                await bot.send_message(owner_id, tracker.daily_report(day_to_report))
-                tracker.set_meta("last_day_reported", game_day(now))
+            await publish_daily_report(bot, now)
             for chat_id, message_id in tracker.due_message_deletions(now):
-                try:
-                    await bot.delete_message(chat_id, message_id)
-                except TelegramBadRequest:
-                    pass
+                await delete_message(bot, chat_id, message_id)
                 tracker.forget_message_deletion(chat_id, message_id)
             for index, kind, alert in tracker.due_alerts(now):
                 message = await bot.send_message(owner_id, alert)
@@ -547,6 +752,7 @@ async def worker(bot: Bot) -> None:
                     message_id=message.message_id,
                     delete_at=time.time() + ALERT_DELETE_DELAY,
                 )
+            await refresh_panel(bot, now)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -571,7 +777,7 @@ async def main() -> None:
     tracker.close_expired(now)
     tracker.settle_weeks(now)
     bot = Bot(TOKEN)
-    dp = Dispatcher()
+    dp = Dispatcher(events_isolation=SimpleEventIsolation())
     dp.include_router(router)
     monitor = asyncio.create_task(worker(bot))
     try:
