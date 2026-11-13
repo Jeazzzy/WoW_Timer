@@ -66,9 +66,8 @@ class TrackerTest(unittest.TestCase):
         self.assertFalse(self.tr.progress(2, tomorrow).fully_done)
         self.assertIn('✅ Паладин Элнин', self.tr.daily_report('2026-10-15'))
 
-    def test_infernal_manual_without_timer(self):
+    def test_infernal_manual_completion_does_not_notify(self):
         t = ts('2026-10-15', 8)
-        self.assertIn('вручную', self.tr.start(MAIN_INDEX, t))
         self.tr.manual(MAIN_INDEX, True, t)
         self.assertTrue(self.tr.progress(MAIN_INDEX, t).norm_done)
         self.assertFalse(self.tr.progress(MAIN_INDEX, t).fully_done)
@@ -77,6 +76,210 @@ class TrackerTest(unittest.TestCase):
         self.assertTrue(self.tr.progress(MAIN_INDEX, t).fully_done)
         self.tr.manual(MAIN_INDEX, False, t)
         self.assertFalse(self.tr.progress(MAIN_INDEX, t).reward_received)
+
+    def test_infernal_timer_warns_and_completes(self):
+        start = ts('2026-10-15', 8)
+        self.assertIn('Таймер запущен', self.tr.start(MAIN_INDEX, start))
+        warning = start + TARGET - 300
+        self.assertEqual([(index, kind) for index, kind, _ in self.tr.due_alerts(warning)],
+                         [(MAIN_INDEX, 'five')])
+        self.tr.mark_alert_sent(MAIN_INDEX, 'five', warning)
+        done = start + TARGET
+        self.assertEqual([(index, kind) for index, kind, _ in self.tr.due_alerts(done)],
+                         [(MAIN_INDEX, 'done')])
+        self.tr.mark_alert_sent(MAIN_INDEX, 'done', done)
+        self.assertEqual(self.tr.due_alerts(done + 1), [])
+        self.assertTrue(self.tr.progress(MAIN_INDEX, done).norm_done)
+        self.assertFalse(self.tr.progress(MAIN_INDEX, done).fully_done)
+        self.tr.reward(MAIN_INDEX, True, done)
+        self.assertTrue(self.tr.progress(MAIN_INDEX, done).fully_done)
+        self.tr.manual(MAIN_INDEX, False, done)
+        self.assertTrue(self.tr.progress(MAIN_INDEX, done).reward_received)
+
+    def test_infernal_manual_stops_partial_timer_and_can_resume(self):
+        start = ts('2026-10-15', 8)
+        self.tr.start(MAIN_INDEX, start)
+        self.tr.manual(MAIN_INDEX, True, start + 30 * 60)
+        marked = self.tr.progress(MAIN_INDEX, start + 40 * 60)
+        self.assertFalse(marked.running)
+        self.assertEqual(marked.elapsed, 30 * 60)
+        self.assertEqual(self.tr.due_alerts(start + 40 * 60), [])
+        self.assertIn('отмени ручную', self.tr.set_remaining(MAIN_INDEX, 60, start + 40 * 60))
+        self.tr.manual(MAIN_INDEX, False, start + 40 * 60)
+        self.tr.start(MAIN_INDEX, start + 40 * 60)
+        self.assertEqual(self.tr.progress(MAIN_INDEX, start + 50 * 60).elapsed, 40 * 60)
+
+    def test_infernal_timer_restores_after_restart(self):
+        start = ts('2026-10-15', 8)
+        self.tr.set_remaining(MAIN_INDEX, 37, start)
+        self.tr.close()
+        self.tr = Tracker(Path(self.tmp.name) / 't.sqlite3')
+        state = self.tr.progress(MAIN_INDEX, start + 10 * 60)
+        self.assertTrue(state.running)
+        self.assertEqual(state.elapsed, 93 * 60)
+
+    def test_infernal_timer_counts_toward_weekly_reward(self):
+        week = '2026-10-14'
+        self.tr.initialize_week(ts(week, 8))
+        for day in week_days(week):
+            start = ts(day, 8)
+            self.tr.start(MAIN_INDEX, start)
+            self.tr.pause(MAIN_INDEX, start + TARGET)
+            self.tr.reward(MAIN_INDEX, True, start + TARGET)
+        self.tr.settle_weeks(ts('2026-10-21', 7))
+        self.assertEqual(self.tr.week_stats(ts('2026-10-21', 7), week)['characters'][MAIN_INDEX]['earned'], 100)
+        self.assertEqual(self.tr.week_tokens_received(week), 100)
+
+    def test_add_rename_and_reorder_keep_character_progress(self):
+        start = ts('2026-10-15', 8)
+        added = self.tr.add_character('Новый герой', 'timer', start)
+        self.assertGreater(added, MAIN_INDEX)
+        self.tr.start(added, start)
+        self.tr.pause(added, start + 35 * 60)
+        self.tr.move_character(added, -1)
+        self.tr.rename_character(added, 'Воин Новый герой')
+        self.assertEqual(self.tr.characters()[-2]['id'], added)
+        self.assertEqual(self.tr.name(added), 'Воин Новый герой')
+        self.assertEqual(self.tr.progress(added, start + 40 * 60).elapsed, 35 * 60)
+        self.assertEqual(self.tr.progress(MAIN_INDEX, start).elapsed, 0)
+
+    def test_change_mode_preserves_elapsed_and_closed_day(self):
+        start = ts('2026-10-15', 8)
+        self.tr.start(0, start)
+        self.tr.set_mode(0, 'manual', start + 30 * 60)
+        state = self.tr.progress(0, start + 40 * 60)
+        self.assertFalse(state.running)
+        self.assertEqual(state.elapsed, 30 * 60)
+        self.assertIn('вручную', self.tr.start(0, start + 40 * 60))
+        self.tr.manual(0, True, start + 40 * 60)
+        self.tr.reward(0, True, start + 40 * 60)
+        self.tr.set_mode(0, 'timer', start + 50 * 60)
+        self.assertTrue(self.tr.progress(0, start + 50 * 60).fully_done)
+        self.tr.set_mode(0, 'both', start + 60 * 60)
+        self.assertTrue(self.tr.progress(0, start + 60 * 60).fully_done)
+        self.assertEqual(self.tr.mode(0), 'both')
+
+    def test_switching_completed_timer_to_manual_suppresses_stale_alert(self):
+        start = ts('2026-10-15', 8)
+        self.tr.start(0, start)
+        self.tr.set_mode(0, 'manual', start + TARGET)
+        self.assertTrue(self.tr.progress(0, start + TARGET).norm_done)
+        self.assertEqual(self.tr.due_alerts(start + TARGET), [])
+
+    def test_archive_restore_preserves_id_and_excludes_gap_days(self):
+        start = ts('2026-10-15', 8)
+        self.tr.start(0, start)
+        self.tr.pause(0, start + TARGET)
+        self.tr.reward(0, True, start + TARGET)
+        self.tr.archive_character(0, start + TARGET + 60)
+        self.assertFalse(self.tr.is_active(0))
+        self.assertTrue(self.tr.progress(0, start + TARGET, '2026-10-15').fully_done)
+        self.assertIn(0, [row['id'] for row in self.tr.characters('2026-10-15')])
+        self.assertNotIn(0, [row['id'] for row in self.tr.characters('2026-10-16')])
+        self.tr.restore_character(0, ts('2026-10-17', 8))
+        self.assertTrue(self.tr.is_active(0))
+        self.assertIn(0, [row['id'] for row in self.tr.characters('2026-10-17')])
+        self.assertNotIn(0, [row['id'] for row in self.tr.characters('2026-10-16')])
+        self.assertEqual(self.tr.week_stats(ts('2026-10-17', 8))['characters'][0]['forecast'], 0)
+        self.tr.close()
+        self.tr = Tracker(Path(self.tmp.name) / 't.sqlite3')
+        self.assertTrue(self.tr.is_active(0))
+        self.assertNotIn(0, [row['id'] for row in self.tr.characters('2026-10-16')])
+
+    def test_archive_and_restore_same_day_reopens_period(self):
+        start = ts('2026-10-15', 8)
+        self.tr.archive_character(0, start)
+        self.tr.restore_character(0, start + 60)
+        periods = self.tr.con.execute(
+            'SELECT start_day,end_day FROM character_periods WHERE character=0'
+        ).fetchall()
+        self.assertEqual(len(periods), 1)
+        self.assertIsNone(periods[0]['end_day'])
+
+    def test_new_character_earns_weekly_reward_once(self):
+        week = '2026-10-14'
+        start = ts(week, 8)
+        self.tr.initialize_week(start)
+        added = self.tr.add_character('Новый персонаж', 'timer', start)
+        for day in week_days(week):
+            self.complete_character_day(self.tr, added, day)
+        reset = ts('2026-10-21', 7)
+        self.assertEqual(self.tr.settle_weeks(reset), [(week, 100)])
+        self.assertEqual(self.tr.settle_weeks(reset), [])
+        self.assertEqual(self.tr.week_tokens_received(week), 100)
+
+    def test_eight_characters_earn_800_without_account_cap(self):
+        week = '2026-10-14'
+        start = ts(week, 8)
+        self.tr.initialize_week(start)
+        self.tr.set_token_balance(0)
+        added = self.tr.add_character('Восьмой персонаж', 'timer', start)
+        self.assertEqual(self.tr.token_forecast(start, weeks=1)[0][1], 800)
+        for day in week_days(week):
+            for index in range(7):
+                self.complete_character_day(self.tr, index, day)
+            self.complete_character_day(self.tr, added, day)
+        reset = ts('2026-10-21', 7)
+        self.assertEqual(self.tr.week_stats(reset, week)['actual_bonus'], 800)
+        self.assertEqual(self.tr.settle_weeks(reset), [(week, 800)])
+        self.assertEqual(self.tr.token_balance(), 800)
+        self.assertEqual(self.tr.settle_weeks(reset), [])
+        self.assertEqual(self.tr.token_balance(), 800)
+
+    def test_new_character_added_midweek_has_no_partial_week_bonus(self):
+        week = '2026-10-14'
+        self.tr.initialize_week(ts(week, 8))
+        added = self.tr.add_character('Поздний герой', 'manual', ts('2026-10-16', 8))
+        for day in week_days(week)[2:]:
+            moment = ts(day, 8)
+            self.tr.manual(added, True, moment)
+            self.tr.reward(added, True, moment)
+        reset = ts('2026-10-21', 7)
+        self.assertEqual(self.tr.week_stats(reset, week)['characters'][-1]['covered'], 5)
+        self.assertEqual(self.tr.settle_weeks(reset), [(week, 0)])
+        self.assertEqual(self.tr.week_tokens_received(week), 0)
+
+    def test_archived_character_can_earn_completed_week_once(self):
+        week = '2026-10-14'
+        self.tr.initialize_week(ts(week, 8))
+        for day in week_days(week):
+            self.complete_character_day(self.tr, 0, day)
+        self.tr.archive_character(0, ts('2026-10-20', 12))
+        reset = ts('2026-10-21', 7)
+        self.assertEqual(self.tr.settle_weeks(reset), [(week, 100)])
+        self.tr.restore_character(0, reset + 60)
+        self.assertEqual(self.tr.settle_weeks(reset + 60), [])
+        self.assertEqual(self.tr.week_tokens_received(week), 100)
+
+    def test_restored_character_timer_and_mode_survive_reopen(self):
+        start = ts('2026-10-15', 8)
+        added = self.tr.add_character('Возвращённый', 'timer', start)
+        self.tr.archive_character(added, start)
+        self.tr.restore_character(added, start + 60)
+        self.tr.start(added, start + 120)
+        self.tr.set_mode(added, 'both', start + 180)
+        self.tr.close()
+        self.tr = Tracker(Path(self.tmp.name) / 't.sqlite3')
+        self.assertEqual(self.tr.mode(added), 'both')
+        self.assertTrue(self.tr.progress(added, start + 1800).running)
+        self.assertEqual(self.tr.progress(added, start + 1800).elapsed, 1680)
+
+    def test_history_denominator_tracks_archived_and_added_characters(self):
+        start = ts('2026-10-15', 8)
+        self.tr.add_character('Новый персонаж', 'timer', start)
+        self.tr.archive_character(0, start)
+        history = self.tr.history(ts('2026-10-17', 8))
+        self.assertIn('14.10.2026 — награды 0/7', history)
+        self.assertIn('15.10.2026 — награды 0/8', history)
+        self.assertIn('16.10.2026 — награды 0/7', history)
+
+    def test_bulk_history_edit_includes_new_character_only_on_eligible_days(self):
+        self.tr.add_character('Новый персонаж', 'timer', ts('2026-10-15', 8))
+        edited = self.tr.complete_previous_week(ts('2026-10-21', 8))
+        self.assertEqual(edited, 55)
+        self.assertEqual(self.tr.complete_previous_week(ts('2026-10-21', 8)), 0)
+        history = self.tr.history(ts('2026-10-21', 8), '2026-10-14')
+        self.assertIn('Собрано наград: 55/55', history)
 
     def test_five_minute_and_done_alert_once(self):
         t = ts('2026-10-15', 9)
@@ -192,7 +395,7 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(stat['covered'], 0)
         self.assertEqual(stat['forecast'], 100)
 
-    def test_seven_days_earn_100_per_character_max_700(self):
+    def test_seven_initial_characters_earn_700(self):
         self.tr.initialize_week(ts('2026-10-14', 8))
         self.tr.set_token_balance(300)
         for day in week_days('2026-10-14'):
@@ -282,6 +485,53 @@ class TrackerTest(unittest.TestCase):
         self.assertTrue(self.tr.buyout(2, '2026-10-15', now).startswith('✅'))
         self.assertEqual(self.tr.token_balance(), 310)
 
+    def test_token_forecast_adds_700_each_week_without_changing_balance(self):
+        now = ts('2026-10-15', 8)
+        self.assertIsNone(self.tr.token_forecast(now))
+        self.tr.set_token_balance(2700)
+        self.assertEqual(self.tr.token_forecast(now, 3), [
+            ('2026-10-21', 3400),
+            ('2026-10-28', 4100),
+            ('2026-11-04', 4800),
+        ])
+        self.tr.buyout(0, '2026-10-14', now)
+        self.assertEqual(self.tr.token_forecast(now, 2), [
+            ('2026-10-21', 3350),
+            ('2026-10-28', 4050),
+        ])
+        self.assertEqual(self.tr.token_balance(), 2650)
+
+    def test_token_forecast_spans_52_wednesdays(self):
+        now = ts('2026-10-15', 8)
+        self.tr.set_token_balance(100)
+        forecast = self.tr.token_forecast(now)
+        self.assertEqual(len(forecast), 52)
+        self.assertEqual(forecast[-1], ('2027-10-13', 100 + 52 * 700))
+
+    def test_previous_week_correction_is_reversible_and_does_not_credit_tokens(self):
+        now = ts('2026-10-29', 8)
+        self.tr.set_token_balance(500)
+        day = '2026-10-22'
+        self.assertTrue(self.tr.set_previous_week_completion(day, 0, True, now))
+        self.assertTrue(self.tr.progress(0, now, day).fully_done)
+        self.assertFalse(self.tr.set_previous_week_completion(day, 0, True, now))
+        self.assertTrue(self.tr.set_previous_week_completion(day, 0, False, now))
+        self.assertFalse(self.tr.progress(0, now, day).fully_done)
+        self.assertEqual(self.tr.token_balance(), 500)
+        self.assertEqual(self.tr.con.execute('SELECT COUNT(*) FROM history_edits').fetchone()[0], 2)
+        with self.assertRaises(ValueError):
+            self.tr.set_previous_week_completion('2026-10-29', 0, True, now)
+
+    def test_complete_previous_week_is_idempotent_and_atomic(self):
+        now = ts('2026-10-29', 8)
+        self.tr.set_token_balance(200)
+        self.assertEqual(self.tr.complete_previous_week(now), 49)
+        self.assertEqual(self.tr.complete_previous_week(now), 0)
+        report = self.tr.history(now, '2026-10-21')
+        self.assertIn('Собрано наград: 49/49', report)
+        self.assertEqual(self.tr.con.execute('SELECT COUNT(*) FROM history_edits').fetchone()[0], 49)
+        self.assertEqual(self.tr.token_balance(), 200)
+
     def test_buyout_not_allowed_for_successful_day_or_previous_week(self):
         self.tr.initialize_week(ts('2026-10-14', 8))
         self.complete_character_day(self.tr, 0, '2026-10-14')
@@ -367,7 +617,8 @@ class TrackerTest(unittest.TestCase):
         self.assertIn('0 до 120', self.tr.set_remaining(0, -1, t))
         self.assertIn('0 до 120', self.tr.set_remaining(0, 4.2, t))
         self.assertIn('Неизвестный', self.tr.set_remaining(10, 40, t))
-        self.assertIn('вручную', self.tr.set_remaining(MAIN_INDEX, 40, t))
+        self.assertIn('осталось 40 мин', self.tr.set_remaining(MAIN_INDEX, 40, t))
+        self.assertTrue(self.tr.progress(MAIN_INDEX, t).running)
         self.assertEqual(self.tr.progress(0, t).elapsed, 0)
 
     def test_corrected_timer_persists_reopen_and_doesnt_carry_past_reset(self):
@@ -442,6 +693,29 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(state.elapsed, 1800)
         self.assertFalse(state.manual_done)
         self.assertFalse(state.reward_received)
+
+    def test_archive_style_character_table_is_migrated_without_renumbering(self):
+        self.tr.close()
+        path = Path(self.tmp.name) / 'archive_style.sqlite3'
+        con = sqlite3.connect(path)
+        con.execute(
+            'CREATE TABLE characters ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, '
+            'manual INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL, '
+            'added_day TEXT NOT NULL, archived_day TEXT)'
+        )
+        con.executemany(
+            'INSERT INTO characters(id,name,manual,position,added_day) VALUES (?,?,?,?,?)',
+            [(0, 'Старое имя', 1, 0, '0001-01-01'),
+             (6, 'Инферналь', 1, 1, '0001-01-01')],
+        )
+        con.commit()
+        con.close()
+        self.tr = Tracker(path)
+        self.assertEqual(self.tr.name(0), 'Старое имя')
+        self.assertEqual(self.tr.mode(0), 'manual')
+        self.assertEqual(self.tr.mode(6), 'both')
+        self.assertTrue(self.tr.participates(0, '2026-10-15'))
 
     def test_missed_week_does_not_retroactively_award_on_first_boot(self):
         now = ts('2026-10-21', 9)

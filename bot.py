@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import date
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router
@@ -17,8 +18,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 from tracker import (
-    CHARACTERS, MAIN_INDEX, TARGET, BUYOUT_COST, Tracker, clock_hm, game_day,
-    game_week, human_date, next_week, previous_week, week_day_number,
+    TARGET, BUYOUT_COST, Tracker, clock_hm, game_day,
+    game_day_end, game_week, human_date, next_week, previous_week,
+    week_day_number, week_days,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,10 +34,19 @@ DB_PATH = Path(os.getenv("DB_PATH", "data/tracker.sqlite3"))
 if not DB_PATH.is_absolute():
     DB_PATH = BASE_DIR / DB_PATH
 ALERT_DELETE_DELAY = 10 * 60
+FORECAST_MONTHS = (
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+)
 
 router = Router()
 tracker: Tracker
 owner_id = 0
+MODE_LABELS = {"timer": "таймер 2 часа", "manual": "ручная отметка", "both": "таймер или вручную"}
+
+
+class CharacterInput(StatesGroup):
+    name = State()
 
 
 class RemainingInput(StatesGroup):
@@ -48,30 +59,34 @@ def is_owner(user_id: int | None) -> bool:
 
 def markup_home():
     b = InlineKeyboardBuilder()
-    for i, character in enumerate(CHARACTERS):
-        b.button(text=character, callback_data=f"view:char:{i}")
+    characters = tracker.characters()
+    for character in characters:
+        b.button(text=character["name"], callback_data=f"view:char:{character['id']}")
     b.button(text="🎁 Награды", callback_data="view:rewards")
     b.button(text="📊 История", callback_data="view:history")
+    b.button(text="🪙 Прогноз токенов", callback_data="view:forecast")
+    b.button(text="⚙️ Персонажи", callback_data="view:settings")
     b.button(text="🔄 Обновить", callback_data="view:home")
-    b.adjust(*([1] * 7), 2, 1)
+    b.adjust(*([1] * len(characters)), 2, 2, 1)
     return b.as_markup()
 
 
 def markup_char(index: int, now: float):
     p = tracker.progress(index, now)
+    mode = tracker.mode(index)
     day = game_day(now)
     b = InlineKeyboardBuilder()
-    if index == MAIN_INDEX:
+    if (mode in ("manual", "both") or p.manual_done) and (p.elapsed < TARGET or p.manual_done):
         if p.manual_done:
             b.button(text="↩️ Отменить норму", callback_data=f"action:manual_off:{index}:{day}")
         else:
-            b.button(text="✅ Норма выполнена", callback_data=f"action:manual_on:{index}:{day}")
-    elif not p.norm_done:
+            b.button(text="✅ Отметить норму вручную", callback_data=f"action:manual_on:{index}:{day}")
+    if mode in ("timer", "both") and not p.norm_done:
         if p.running:
             b.button(text="⏸ Остановить таймер", callback_data=f"action:pause:{index}:{day}")
         else:
             b.button(text="▶️ Начать / продолжить", callback_data=f"action:start:{index}:{day}")
-    if index != MAIN_INDEX and not p.reward_received:
+    if mode in ("timer", "both") and not p.reward_received and not p.manual_done:
         b.button(text="⏱ Установить остаток (мин)",
                  callback_data=f"action:remaining:{index}:{day}")
     if p.norm_done:
@@ -93,7 +108,7 @@ def markup_rewards(now: float):
             continue
         action = "reward_off" if p.reward_received else "reward_on"
         symbol = "✅" if p.reward_received else "🎁"
-        b.button(text=f"{symbol} {CHARACTERS[p.character]}",
+        b.button(text=f"{symbol} {tracker.name(p.character)}",
                  callback_data=f"action:{action}:{p.character}:{day}")
     b.button(text="🔄 Обновить", callback_data="view:rewards")
     b.button(text="⬅️ К списку", callback_data="view:home")
@@ -104,6 +119,7 @@ def markup_rewards(now: float):
 def markup_history(now: float, previous: bool = False):
     b = InlineKeyboardBuilder()
     if previous:
+        b.button(text="✏️ Исправить неделю", callback_data="view:historyedit")
         b.button(text="📊 Текущая неделя", callback_data="view:history")
         b.button(text="🔄 Обновить", callback_data="view:historyprev")
     else:
@@ -116,11 +132,61 @@ def markup_history(now: float, previous: bool = False):
     return b.as_markup()
 
 
+def markup_history_edit(now: float):
+    builder = InlineKeyboardBuilder()
+    for offset, day in enumerate(week_days(previous_week(game_week(now)))):
+        states = tracker.all_progress(game_day_end(day), day)
+        completed = sum(state.fully_done for state in states)
+        builder.button(text=f"{human_date(day)} · {completed}/{len(states)}",
+                       callback_data=f"view:historyday:{offset}")
+    builder.button(text="✅ Отметить всю неделю", callback_data="view:historyallconfirm")
+    builder.button(text="⬅️ К прошлой неделе", callback_data="view:historyprev")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def markup_history_day(now: float, offset: int):
+    day = week_days(previous_week(game_week(now)))[offset]
+    builder = InlineKeyboardBuilder()
+    for character in tracker.characters(day):
+        index = int(character["id"])
+        state = tracker.progress(index, game_day_end(day), day)
+        symbol = "✅" if state.fully_done else "▫️"
+        builder.button(text=f"{symbol} {character['name']}", callback_data=f"hist:toggle:{index}:{day}")
+    builder.button(text="⬅️ К дням недели", callback_data="view:historyedit")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def markup_history_all_confirm(now: float):
+    builder = InlineKeyboardBuilder()
+    week = previous_week(game_week(now))
+    builder.button(text="✅ Да, все награды получены", callback_data=f"hist:all:{week}")
+    builder.button(text="Отмена", callback_data="view:historyedit")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def markup_forecast(year_page: int | None = None):
+    builder = InlineKeyboardBuilder()
+    if year_page is None:
+        builder.button(text="🗓 Весь год", callback_data="view:forecastyear:0")
+    else:
+        if year_page > 0:
+            builder.button(text="◀️ Назад", callback_data=f"view:forecastyear:{year_page - 1}")
+        if year_page < 3:
+            builder.button(text="Дальше ▶️", callback_data=f"view:forecastyear:{year_page + 1}")
+        builder.button(text="📅 Ближайшие", callback_data="view:forecast")
+    builder.button(text="⬅️ На главную", callback_data="view:home")
+    builder.adjust(2, 1, 1)
+    return builder.as_markup()
+
+
 def markup_buyouts(now: float):
     b = InlineKeyboardBuilder()
     stats = tracker.week_stats(now)
     for char in stats["characters"]:
-        if char["missed"]:
+        if char["missed"] and tracker.is_active(char["index"]):
             b.button(text=char["name"], callback_data=f"view:weekchar:{char['index']}")
     b.button(text="⬅️ К истории", callback_data="view:history")
     b.adjust(1)
@@ -130,7 +196,7 @@ def markup_buyouts(now: float):
 def markup_weekchar(index: int, now: float):
     b = InlineKeyboardBuilder()
     stats = tracker.week_stats(now)
-    char = stats["characters"][index]
+    char = next(character for character in stats["characters"] if character["index"] == index)
     for day in char["missed"]:
         b.button(text=f"💳 Отметить выкуп {human_date(day)} (−{BUYOUT_COST})",
                  callback_data=f"buy:confirm:{index}:{day}")
@@ -167,14 +233,16 @@ def home_text(now: float) -> str:
     total_done = sum(p.fully_done for p in rows)
     lines = ["🎮 WoW Tracker", f"Игровые сутки: {human_date(day)}",
              f"Неделя: {human_date(week)} — {human_date(next_week(week))}"]
-    lines.extend([f"День {week_day_number(now)}", f"Закрыто: {total_done}/7"])
+    lines.extend([f"День {week_day_number(now)}", f"Закрыто: {total_done}/{len(rows)}"])
     balance = tracker.token_balance()
     if balance is not None:
         lines.append(f"Учётный баланс сейчас: {balance}")
     lines.append("")
     for p in rows:
-        name = CHARACTERS[p.character]
-        if p.character == MAIN_INDEX:
+        name = tracker.name(p.character)
+        if p.manual_done:
+            desc = "норма отмечена вручную"
+        elif tracker.mode(p.character) == "manual" and not p.norm_done:
             desc = "ручная отметка"
         else:
             desc = (f"{clock_hm(p.elapsed)}/02:00 — осталось "
@@ -186,14 +254,13 @@ def home_text(now: float) -> str:
 
 def character_text(index: int, now: float) -> str:
     p = tracker.progress(index, now)
-    lines = [f"🎮 {CHARACTERS[index]}", f"Игровые сутки: {human_date(game_day(now))}", ""]
-    if index == MAIN_INDEX:
-        lines.append(f"Норма: {'✅ Отмечена вручную' if p.manual_done else '▫️ Не отмечена'}")
-        lines.append("Таймер и уведомления отключены.")
-    else:
-        lines.append(f"Онлайн: {clock_hm(p.elapsed)}/02:00")
-        if not p.norm_done:
-            lines.append(f"Осталось: {clock_hm(TARGET - p.elapsed)}")
+    lines = [f"🎮 {tracker.name(index)}", f"Игровые сутки: {human_date(game_day(now))}",
+             f"Режим: {MODE_LABELS[tracker.mode(index)]}", ""]
+    lines.append(f"Онлайн: {clock_hm(p.elapsed)}/02:00")
+    if not p.norm_done:
+        lines.append(f"Осталось: {clock_hm(TARGET - p.elapsed)}")
+    if p.manual_done:
+        lines.append("Норма отмечена вручную.")
     lines.extend(["", f"Статус: {status_label(p)}",
                   f"Награда: {'✅ Получена' if p.reward_received else '❌ Не получена'}"])
     return "\n".join(lines)
@@ -204,7 +271,7 @@ def rewards_text(now: float) -> str:
     lines = ["🎁 Награды за игровые сутки " + human_date(game_day(now)), ""]
     for p in rows:
         label = "✅ Получена" if p.reward_received else "🎁 Можно отметить" if p.norm_done else "🔒 Сначала норма"
-        lines.append(f"{CHARACTERS[p.character]} — {label}")
+        lines.append(f"{tracker.name(p.character)} — {label}")
     lines.extend(["", "Неполученные до 07:00 МСК награды сгорают.",
                   "Кнопки появятся, когда выполнена норма."])
     return "\n".join(lines)
@@ -217,14 +284,41 @@ def buyouts_text(now: float) -> str:
             "Выбери персонажа с пропущенным днём.")
 
 
+def forecast_text(now: float, year_page: int | None = None) -> str:
+    forecast = tracker.token_forecast(now)
+    if forecast is None:
+        return "🪙 Токены\n\nБаланс не задан · /balance 250"
+    first = 0 if year_page is None else year_page * 13
+    entries = forecast[first:first + (4 if year_page is None else 13)]
+    balance = tracker.token_balance()
+    title = "📅 Ближайшие 4 недели" if year_page is None else f"🗓 Год · {year_page + 1}/4"
+    lines = ["🪙 Токены", f"Сейчас: {balance:,}".replace(",", " "), "", title]
+    last_month = None
+    for day, amount in entries:
+        day_date = date.fromisoformat(day)
+        month = (day_date.year, day_date.month)
+        if month != last_month:
+            lines.extend(["", f"{FORECAST_MONTHS[day_date.month - 1]} {day_date.year}"])
+            last_month = month
+        lines.append(f"{human_date(day)}  →  {amount:,}".replace(",", " "))
+    return "\n".join(lines)
+
+
+def history_day_text(now: float, offset: int) -> str:
+    day = week_days(previous_week(game_week(now)))[offset]
+    return f"✏️ {human_date(day)}\n\nОтметь персонажей, чьи нормы и награды были выполнены."
+
+
 def weekchar_text(index: int, now: float) -> str:
     stats = tracker.week_stats(now)
-    char = stats["characters"][index]
+    char = next(character for character in stats["characters"] if character["index"] == index)
     today = game_day(now)
     lines = [f"💳 {char['name']} — неделя {human_date(stats['week'])}",
              f"Закрыто: {char['covered']}/7; выкуплено: {len(char['bought'])}", ""]
     for day in stats["days"]:
-        if tracker.was_bought(day, index):
+        if day not in char["eligible"]:
+            state = "▫️ Не участвовал"
+        elif tracker.was_bought(day, index):
             state = "💳 Выкуплен (−50)"
         elif tracker.day_covered(day, index, now):
             state = "✅ Время + награда"
@@ -241,7 +335,65 @@ def weekchar_text(index: int, now: float) -> str:
     return "\n".join(lines)
 
 
+def settings_screen(index: int | None = None):
+    builder = InlineKeyboardBuilder()
+    if index is None:
+        lines = ["⚙️ Персонажи", "Выбери персонажа:"]
+        for character in tracker.characters():
+            builder.button(text=character["name"],
+                           callback_data=f"view:settings:{character['id']}")
+        builder.button(text="➕ Добавить", callback_data="manage:add")
+        builder.button(text="📦 Архив", callback_data="view:archive")
+    else:
+        character = tracker.character(index)
+        lines = [f"⚙️ {character['name']}", f"Тип учёта: {MODE_LABELS[character['mode']]}"]
+        identifiers = [int(item["id"]) for item in tracker.characters()]
+        if identifiers.index(index) > 0:
+            builder.button(text="↑ Выше", callback_data=f"manage:up:{index}")
+        if identifiers.index(index) < len(identifiers) - 1:
+            builder.button(text="↓ Ниже", callback_data=f"manage:down:{index}")
+        builder.button(text="🔁 Изменить тип учёта", callback_data=f"manage:mode:{index}")
+        builder.button(text="✏️ Переименовать", callback_data=f"manage:rename:{index}")
+        builder.button(text="📦 Архивировать", callback_data=f"manage:archive:{index}")
+        builder.button(text="⬅️ Персонажи", callback_data="view:settings")
+    builder.button(text="⬅️ На главную", callback_data="view:home")
+    builder.adjust(1)
+    return "\n".join(lines), builder.as_markup()
+
+
+def archive_screen(index: int | None = None):
+    builder = InlineKeyboardBuilder()
+    if index is None:
+        lines = ["📦 Архив персонажей"]
+        archived = tracker.archived_characters()
+        if not archived:
+            lines.append("Пока пусто.")
+        for character in archived:
+            builder.button(text=character["name"],
+                           callback_data=f"view:archived:{character['id']}")
+    else:
+        character = tracker.character(index)
+        lines = [f"📦 {character['name']}", f"Тип учёта: {MODE_LABELS[character['mode']]}"]
+        builder.button(text="↩️ Вернуть персонажа", callback_data=f"manage:restore:{index}")
+        builder.button(text="⬅️ Архив", callback_data="view:archive")
+    builder.button(text="⬅️ Персонажи", callback_data="view:settings")
+    builder.adjust(1)
+    return "\n".join(lines), builder.as_markup()
+
+
+def cancel_markup():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Отмена", callback_data="view:settings")
+    return builder.as_markup()
+
+
 def screen(view: str, now: float, index: int | None = None):
+    if view == "settings":
+        return settings_screen(index)
+    if view == "archive":
+        return archive_screen()
+    if view == "archived" and index is not None:
+        return archive_screen(index)
     if view == "char" and index is not None:
         return character_text(index, now), markup_char(index, now)
     if view == "rewards":
@@ -255,8 +407,19 @@ def screen(view: str, now: float, index: int | None = None):
     if view == "historyprev":
         week = previous_week(game_week(now))
         return tracker.history(now, week), markup_history(now, previous=True)
+    if view == "historyedit":
+        return "✏️ Прошлая неделя\n\nВыбери день:", markup_history_edit(now)
+    if view == "historyday" and index is not None:
+        return history_day_text(now, index), markup_history_day(now, index)
+    if view == "historyallconfirm":
+        return ("Отметить полученными все награды прошлой недели?",
+                markup_history_all_confirm(now))
     if view == "buyouts":
         return buyouts_text(now), markup_buyouts(now)
+    if view == "forecast":
+        return forecast_text(now), markup_forecast()
+    if view == "forecastyear" and index is not None:
+        return forecast_text(now, index), markup_forecast(index)
     return home_text(now), markup_home()
 
 
@@ -359,7 +522,8 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
         "Недельный прогресс и прошлая неделя находятся в разделе «История». "
         "Пропущенный день можно отметить как выкупленный там после покупки в игре. "
         "Баланс можно задать командой /balance 250.\n\n"
-        "Инферналь: ручная норма и отдельная награда, без таймера и уведомлений. "
+        "Тип учёта, порядок и архив персонажей — в разделе «⚙️ Персонажи». "
+        "Награду после нормы отметь отдельно. "
         "Бот не считывает фактический онлайн из WoW: всё учитывается по твоим нажатиям."
     )
 
@@ -370,7 +534,7 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         return
     active = await state.get_state()
     await state.clear()
-    await message.answer("Ввод оставшихся минут отменён." if active else
+    await message.answer("Ввод отменён." if active else
                          "Сейчас нет ожидающего ввода.")
 
 
@@ -392,7 +556,7 @@ async def receive_remaining(message: Message, state: FSMContext) -> None:
     await state.clear()
     now = time.time()
     tracker.close_expired(now)
-    if not isinstance(index, int) or not 0 <= index < len(CHARACTERS):
+    if not isinstance(index, int) or not tracker.is_active(index):
         await message.answer("Персонаж не выбран. Открой /start и попробуй ещё раз.")
         return
     if day != game_day(now):
@@ -402,6 +566,25 @@ async def receive_remaining(message: Message, state: FSMContext) -> None:
     result = tracker.set_remaining(index, minutes, now)
     text, keyboard = screen("char", now, index)
     await message.answer(result + "\n\n" + text, reply_markup=keyboard)
+
+
+@router.message(CharacterInput.name)
+async def receive_character_name(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id if message.from_user else None):
+        return
+    data = await state.get_data()
+    try:
+        if "index" in data:
+            index = data["index"]
+            tracker.rename_character(index, message.text or "")
+        else:
+            index = tracker.add_character(message.text or "", data["mode"], time.time())
+    except (ValueError, KeyError) as error:
+        await message.answer(str(error))
+        return
+    await state.clear()
+    text, markup = settings_screen(index)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query()
@@ -416,25 +599,123 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
     tracker.settle_weeks(now)
     # Navigating to another screen/action cancels an unfinished minutes prompt.
     await state.clear()
+    if parts[0] == "manage":
+        await callback.answer()
+        try:
+            operation = parts[1]
+            if operation == "add" and len(parts) == 2:
+                builder = InlineKeyboardBuilder()
+                for mode, label in MODE_LABELS.items():
+                    builder.button(text=label, callback_data=f"manage:new:{mode}")
+                builder.button(text="Отмена", callback_data="view:settings")
+                builder.adjust(1)
+                if isinstance(callback.message, Message):
+                    await callback.message.edit_text("Выбери тип учёта нового персонажа:",
+                                                     reply_markup=builder.as_markup())
+                return
+            if operation == "new" and len(parts) == 3 and parts[2] in MODE_LABELS:
+                await state.set_state(CharacterInput.name)
+                await state.update_data(mode=parts[2])
+                await callback.bot.send_message(owner_id, "Введи имя персонажа (1–60 символов).",
+                                                reply_markup=cancel_markup())
+                return
+            if operation == "setmode" and len(parts) == 4:
+                index = int(parts[2])
+                tracker.set_mode(index, parts[3], now)
+                await redraw(callback, "settings", index, notice="✅ Тип учёта изменён")
+                return
+            if len(parts) != 3:
+                raise ValueError("Неизвестная операция")
+            index = int(parts[2])
+            if operation == "restore":
+                tracker.restore_character(index, now)
+                await redraw(callback, "settings", index, notice="✅ Персонаж возвращён из архива")
+                return
+            if not tracker.is_active(index):
+                raise ValueError("Персонаж уже архивирован")
+            if operation in ("up", "down"):
+                tracker.move_character(index, -1 if operation == "up" else 1)
+                await redraw(callback, "settings", index)
+            elif operation == "mode":
+                builder = InlineKeyboardBuilder()
+                for mode, label in MODE_LABELS.items():
+                    builder.button(text=label, callback_data=f"manage:setmode:{index}:{mode}")
+                builder.button(text="Отмена", callback_data=f"view:settings:{index}")
+                builder.adjust(1)
+                if isinstance(callback.message, Message):
+                    await callback.message.edit_text(f"Тип учёта для {tracker.name(index)}:",
+                                                     reply_markup=builder.as_markup())
+            elif operation == "rename":
+                await state.set_state(CharacterInput.name)
+                await state.update_data(index=index)
+                await callback.bot.send_message(owner_id, "Введи новое имя (1–60 символов).",
+                                                reply_markup=cancel_markup())
+            elif operation == "archive":
+                builder = InlineKeyboardBuilder()
+                builder.button(text="📦 Да, архивировать", callback_data=f"manage:archive_yes:{index}")
+                builder.button(text="Отмена", callback_data=f"view:settings:{index}")
+                builder.adjust(1)
+                if isinstance(callback.message, Message):
+                    await callback.message.edit_text(
+                        f"Архивировать {tracker.name(index)}? История сохранится, таймер остановится.",
+                        reply_markup=builder.as_markup(),
+                    )
+            elif operation == "archive_yes":
+                tracker.archive_character(index, now)
+                await redraw(callback, "archive", notice="📦 Персонаж архивирован")
+            else:
+                raise ValueError("Неизвестная операция")
+        except (ValueError, IndexError) as error:
+            await redraw(callback, "settings", notice=str(error))
+        return
     if len(parts) >= 2 and parts[0] == "view":
         await callback.answer()
         view = parts[1]
         index = None
-        if view in ("char", "weekchar") and len(parts) == 3:
+        if view in ("char", "weekchar", "forecastyear", "historyday", "settings", "archived") and len(parts) == 3:
             try:
                 index = int(parts[2])
-                if not 0 <= index < len(CHARACTERS):
+                if view == "forecastyear" and not 0 <= index < 4:
+                    raise ValueError
+                if view == "historyday" and not 0 <= index < 7:
+                    raise ValueError
+                if view in ("char", "weekchar", "settings") and not tracker.is_active(index):
+                    raise ValueError
+                if view == "archived" and tracker.character(index)["archived_day"] is None:
                     raise ValueError
             except ValueError:
                 await redraw(callback, "home")
                 return
         await redraw(callback, view, index)
         return
+    if len(parts) == 3 and parts[:2] == ["hist", "all"]:
+        if parts[2] != previous_week(game_week(now)):
+            await callback.answer("Кнопка устарела, открой прошлую неделю заново", show_alert=True)
+            return
+        changed = tracker.complete_previous_week(now)
+        await callback.answer()
+        await redraw(callback, "historyprev", notice=f"✅ Отмечено наград: {changed}")
+        return
+    if len(parts) == 4 and parts[:2] == ["hist", "toggle"]:
+        try:
+            index = int(parts[2])
+            day = parts[3]
+            if day not in week_days(previous_week(game_week(now))) or not tracker.participates(index, day):
+                raise ValueError
+            done = not tracker.progress(index, game_day_end(day), day).fully_done
+            tracker.set_previous_week_completion(day, index, done, now)
+        except ValueError as error:
+            await callback.answer(str(error), show_alert=True)
+            return
+        await callback.answer()
+        offset = week_days(previous_week(game_week(now))).index(day)
+        await redraw(callback, "historyday", offset)
+        return
     if len(parts) == 4 and parts[0] == "buy":
         _, kind, index_text, day = parts
         try:
             index = int(index_text)
-            if not 0 <= index < len(CHARACTERS):
+            if not tracker.is_active(index):
                 raise ValueError
         except ValueError:
             await callback.answer("Некорректный персонаж", show_alert=True)
@@ -449,7 +730,7 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
                 await redraw(callback, "weekchar", index)
                 return
             await callback.answer()
-            text = (f"Подтвердить учёт выкупа?\n\n{CHARACTERS[index]} — {human_date(day)}\n"
+            text = (f"Подтвердить учёт выкупа?\n\n{tracker.name(index)} — {human_date(day)}\n"
                     f"Стоимость: −{BUYOUT_COST} токенов.\n\n"
                     "Подтверждай только после фактической покупки в игре. Отмены расхода нет.")
             if isinstance(callback.message, Message):
@@ -466,7 +747,7 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
         action, index_text, day = parts[1:]
         try:
             index = int(index_text)
-            if not 0 <= index < len(CHARACTERS):
+            if not tracker.is_active(index):
                 raise ValueError
         except ValueError:
             await callback.answer("Некорректный персонаж", show_alert=True)
@@ -476,8 +757,8 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
             await redraw(callback, "home")
             return
         if action == "remaining":
-            if index == MAIN_INDEX:
-                await callback.answer("У Инферналя нет таймера", show_alert=True)
+            if tracker.mode(index) == "manual":
+                await callback.answer("У персонажа выбран ручной учёт", show_alert=True)
                 return
             if tracker.progress(index, now).reward_received:
                 await callback.answer("Награда уже отмечена. Правка недоступна", show_alert=True)
@@ -487,7 +768,7 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.answer()
             await callback.bot.send_message(
                 owner_id,
-                f"⏱ {CHARACTERS[index]} — введи, сколько минут осталось до 2 часов "
+                f"⏱ {tracker.name(index)} — введи, сколько минут осталось до 2 часов "
                 "(целое число от 0 до 120).\n\n"
                 "Например, 37 → таймер на 37 минут с момента твоего ответа. "
                 "0 → сразу завершить норму, 120 → начать отсчёт заново.\n"
